@@ -1,5 +1,6 @@
 import json
 import os
+import subprocess
 import cv2
 import glob
 from typing import Dict, List, Tuple, Optional
@@ -39,31 +40,37 @@ def get_frame_annotation(frame_num: int, timeline_segments: List[Dict]) -> Tuple
         timeline_segments: List of timeline segments
 
     Returns:
-        Tuple of (labels_with_bbox_flag, meta_text, bounding_boxes)
-        where labels_with_bbox_flag is a list of (label, has_bbox) tuples
+        Tuple of (labels_with_bbox_flag, meta_text, drawable_bboxes)
+        drawable_bboxes is a list of dicts with {x, y, width, height, labels}
+        containing only the keyframes that fall on this exact frame number.
     """
     labels_with_bbox = []
     meta_text = []
-    bounding_boxes = []
+    drawable_bboxes = []
 
     for segment in timeline_segments:
         # Check if frame is in this segment
         if segment['start_frame'] <= frame_num <= segment['end_frame']:
-            # Check if this segment has any bounding boxes
             has_bbox = len(segment.get('bounding_boxes', [])) > 0
 
-            # Add labels with bbox flag
             for label in segment['labels']:
                 labels_with_bbox.append((label, has_bbox))
 
             meta_text.extend(segment['meta_text'])
 
-            # Check for bounding boxes at this specific frame
+            # Check each bbox's keyframes for an exact match on this frame
             for bbox in segment['bounding_boxes']:
-                if bbox['frame'] == frame_num:
-                    bounding_boxes.append(bbox)
+                for kf in bbox.get('keyframes', []):
+                    if kf['frame'] == frame_num:
+                        drawable_bboxes.append({
+                            'x': kf['x'],
+                            'y': kf['y'],
+                            'width': kf['width'],
+                            'height': kf['height'],
+                            'labels': bbox['labels'],
+                        })
 
-    return labels_with_bbox, meta_text, bounding_boxes
+    return labels_with_bbox, meta_text, drawable_bboxes
 
 
 def draw_text_with_background(frame, text: str, position: Tuple[int, int],
@@ -111,21 +118,15 @@ def draw_bounding_box(frame, bbox: Dict, frame_width: int, frame_height: int):
 
     Args:
         frame: Video frame
-        bbox: Bounding box dictionary with x, y, width, height in percentage
+        bbox: Dict with {x, y, width, height} in percentage and optional labels
         frame_width: Frame width in pixels
         frame_height: Frame height in pixels
     """
     # Convert percentage to pixel coordinates
-    x_percent = bbox['x']
-    y_percent = bbox['y']
-    width_percent = bbox['width']
-    height_percent = bbox['height']
-
-    # Calculate pixel coordinates
-    x1 = int((x_percent / 100) * frame_width)
-    y1 = int((y_percent / 100) * frame_height)
-    x2 = int(((x_percent + width_percent) / 100) * frame_width)
-    y2 = int(((y_percent + height_percent) / 100) * frame_height)
+    x1 = int((bbox['x'] / 100) * frame_width)
+    y1 = int((bbox['y'] / 100) * frame_height)
+    x2 = int(((bbox['x'] + bbox['width']) / 100) * frame_width)
+    y2 = int(((bbox['y'] + bbox['height']) / 100) * frame_height)
 
     # Draw rectangle
     cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
@@ -133,7 +134,6 @@ def draw_bounding_box(frame, bbox: Dict, frame_width: int, frame_height: int):
     # Draw label if available
     if bbox.get('labels'):
         label_text = ', '.join(bbox['labels'])
-        # Draw label background and text above the box
         label_y = max(y1 - 10, 20)
         draw_text_with_background(frame, label_text, (x1, label_y),
                                  font_scale=0.6, thickness=2,
@@ -148,7 +148,7 @@ def visualize_video(annotation_file: str, video_root_dir: str, output_dir: str =
     Args:
         annotation_file: Path to the annotation JSON file
         video_root_dir: Root directory containing videos
-        output_dir: Directory to save output videos (default: same as annotation file)
+        output_dir: Directory to save output videos (default: annotations_dir/visualizations)
     """
     # Load annotation
     with open(annotation_file, 'r', encoding='utf-8') as f:
@@ -190,14 +190,22 @@ def visualize_video(annotation_file: str, video_root_dir: str, output_dir: str =
     video_name_no_ext = os.path.splitext(video_name)[0]
     output_path = os.path.join(output_dir, f"{video_name_no_ext}_visualized.mp4")
 
-    # Create video writer
-    fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-    out = cv2.VideoWriter(output_path, fourcc, fps, (frame_width, frame_height))
-
-    if not out.isOpened():
-        print(f"  ✗ Failed to create output video: {output_path}")
-        cap.release()
-        return
+    # Open ffmpeg process for H.264 encoding via pipe
+    ffmpeg_cmd = [
+        'ffmpeg', '-y',
+        '-f', 'rawvideo',
+        '-vcodec', 'rawvideo',
+        '-s', f'{frame_width}x{frame_height}',
+        '-pix_fmt', 'bgr24',
+        '-r', str(fps),
+        '-i', 'pipe:0',
+        '-vcodec', 'libx264',
+        '-pix_fmt', 'yuv420p',
+        '-crf', '18',
+        output_path,
+    ]
+    ffmpeg_proc = subprocess.Popen(ffmpeg_cmd, stdin=subprocess.PIPE,
+                                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
     # Process each frame
     frame_num = 0
@@ -211,18 +219,16 @@ def visualize_video(annotation_file: str, video_root_dir: str, output_dir: str =
         frame_num += 1
 
         # Get annotations for this frame
-        labels_with_bbox, meta_text, bboxes = get_frame_annotation(frame_num, timeline_segments)
+        labels_with_bbox, meta_text, drawable_bboxes = get_frame_annotation(frame_num, timeline_segments)
 
-        # Draw bounding boxes
-        for bbox in bboxes:
+        # Draw bounding boxes (each entry is already a {x,y,width,height,labels} dict)
+        for bbox in drawable_bboxes:
             draw_bounding_box(frame, bbox, frame_width, frame_height)
 
         # Draw temporal labels at middle bottom
         if labels_with_bbox or meta_text:
-            # Combine labels and meta text
             display_texts = []
             if labels_with_bbox:
-                # Format labels with bbox indicator
                 formatted_labels = []
                 for label, has_bbox in labels_with_bbox:
                     if has_bbox:
@@ -233,18 +239,15 @@ def visualize_video(annotation_file: str, video_root_dir: str, output_dir: str =
             if meta_text:
                 display_texts.append(f"Meta: {' | '.join(meta_text)}")
 
-            # Calculate position (middle bottom)
             y_offset = frame_height - 20
 
             for text in display_texts:
-                # Calculate x position to center the text
                 font = cv2.FONT_HERSHEY_SIMPLEX
                 font_scale = 0.8
                 thickness = 2
-                (text_width, text_height), baseline = cv2.getTextSize(text, font, font_scale, thickness)
+                (text_width, _), _ = cv2.getTextSize(text, font, font_scale, thickness)
                 x_pos = (frame_width - text_width) // 2
 
-                # Draw text with background
                 height = draw_text_with_background(frame, text, (x_pos, y_offset),
                                                   font_scale=font_scale, thickness=thickness,
                                                   text_color=(255, 255, 255),
@@ -260,8 +263,8 @@ def visualize_video(annotation_file: str, video_root_dir: str, output_dir: str =
                                  bg_color=(0, 0, 0),
                                  padding=5)
 
-        # Write frame
-        out.write(frame)
+        # Send raw frame bytes to ffmpeg
+        ffmpeg_proc.stdin.write(frame.tobytes())
         processed_frames += 1
 
         # Progress indicator
@@ -271,37 +274,56 @@ def visualize_video(annotation_file: str, video_root_dir: str, output_dir: str =
 
     # Cleanup
     cap.release()
-    out.release()
+    ffmpeg_proc.stdin.close()
+    ffmpeg_proc.wait()
 
     print(f"\n  ✓ Visualization saved: {output_path}")
     print(f"  Processed {processed_frames} frames")
 
 
-def process_all_annotations(annotations_dir: str, video_root_dir: str, output_dir: str = None):
+def process_annotations(
+    video_root_dir: str,
+    output_dir: str = None,
+    annotations_dir: str = None,
+    specific_files: List[str] = None,
+    max_files: int = None,
+):
     """
-    Process all annotation files in a directory.
+    Process annotation files — either a specific list of files or a whole folder.
 
     Args:
-        annotations_dir: Directory containing annotation JSON files
         video_root_dir: Root directory containing videos
         output_dir: Directory to save output videos
+        annotations_dir: Directory containing *_annotations.json files (folder mode)
+        specific_files: List of annotation JSON file paths to process (single/subset mode)
+        max_files: If set, process at most this many files (applies to folder mode)
     """
-    # Find all annotation JSON files
-    annotation_files = glob.glob(os.path.join(annotations_dir, '*_annotations.json'))
-
-    if not annotation_files:
-        print(f"No annotation files found in {annotations_dir}")
+    if specific_files:
+        annotation_files = [f for f in specific_files if os.path.isfile(f)]
+        missing = [f for f in specific_files if not os.path.isfile(f)]
+        for m in missing:
+            print(f"Warning: file not found, skipping: {m}")
+    elif annotations_dir:
+        annotation_files = sorted(glob.glob(os.path.join(annotations_dir, '*_annotations.json')))
+        if max_files is not None:
+            annotation_files = annotation_files[:max_files]
+    else:
+        print("Error: provide either annotations_dir or specific_files.")
         return
 
-    print(f"Found {len(annotation_files)} annotation files")
+    if not annotation_files:
+        print("No annotation files to process.")
+        return
+
+    print(f"Found {len(annotation_files)} annotation file(s) to process.")
     print("=" * 60)
 
     for i, annotation_file in enumerate(annotation_files, 1):
-        print(f"\n[{i}/{len(annotation_files)}] Processing: {os.path.basename(annotation_file)}")
+        print(f"\n[{i}/{len(annotation_files)}] {os.path.basename(annotation_file)}")
         try:
             visualize_video(annotation_file, video_root_dir, output_dir)
         except Exception as e:
-            print(f"  ✗ Error processing {annotation_file}: {e}")
+            print(f"  ✗ Error: {e}")
             import traceback
             traceback.print_exc()
 
@@ -310,10 +332,25 @@ def process_all_annotations(annotations_dir: str, video_root_dir: str, output_di
 
 
 if __name__ == "__main__":
-    # Configuration
-    annotations_directory = '/home/ubuntu/yifan/code/FACT_actseg/labelstudio/export_json/extracted_annotations_0111'
-    video_root_directory = '/home/ubuntu/yifan/code/FACT_actseg/downloaded_videos'
-    output_directory = '/home/ubuntu/yifan/code/FACT_actseg/labelstudio/export_json/extracted_annotations_0111/visualizations'
+    # ── Configuration ──────────────────────────────────────────────────────────
+    VIDEO_ROOT_DIR   = '/home/ubuntu/yifan/code/FACT_actseg/Data_Filtering/filtered_videos'
+    OUTPUT_DIR       = './anno/visualizations'
 
-    # Process all annotations
-    process_all_annotations(annotations_directory, video_root_directory, output_directory)
+    # ── Mode: choose one ───────────────────────────────────────────────────────
+    # Option A — process a whole folder (set MAX_FILES=None to process all)
+    ANNOTATIONS_DIR  = './anno/good_quality_round_annotated_305_0223'
+    MAX_FILES        = 10          # e.g. 5 to process only the first 5 files
+
+    # Option B — process specific files only (overrides folder mode when non-empty)
+    SPECIFIC_FILES   = [
+        './anno/good_quality_round_annotated_305_0223/2025-10-05_03-48-41_010497_013126_annotations.json',
+    ]
+    # ──────────────────────────────────────────────────────────────────────────
+
+    process_annotations(
+        video_root_dir=VIDEO_ROOT_DIR,
+        output_dir=OUTPUT_DIR,
+        annotations_dir=ANNOTATIONS_DIR if not SPECIFIC_FILES else None,
+        specific_files=SPECIFIC_FILES if SPECIFIC_FILES else None,
+        max_files=MAX_FILES,
+    )
