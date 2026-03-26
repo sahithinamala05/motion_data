@@ -1,6 +1,14 @@
-# Hit Segment Processing
+# Episode Segment Processing
 
-Processes `instance_segments.json` from FACT_actseg to extract `hit` / `dealer hits` segments with associated card detection bounding boxes, matching the manual label format.
+Scripts for extracting action segments from FACT_actseg `instance_segments.json` with associated card detection bounding boxes, matching the manual label format.
+
+---
+
+## Hit / Dealer Hits (`process_hit_segments.py`)
+
+Extracts `hit` / `dealer hits` segments with bounding boxes via new-card detection.
+
+Supports **resuming after interruption**: already-written annotation JSONs are skipped on re-run.
 
 ## Filtering Pipeline
 
@@ -25,28 +33,28 @@ Stage 3 – spatial
     hit         : centroid y >= 450 px; if multiple, pick highest-y card.
     │
     ▼
-Output annotations JSON (per video)
+Output annotations JSON (per video, written immediately for resume support)
 ```
 
-Each stage is independent; failures at every stage are recorded and visualised separately.
+Each stage is independent; failures at every stage are recorded and optionally visualised.
 
 ## Usage
 
 ```bash
-# Full run (filtering + failure vis, no success vis)
+# Full run (filtering only, no vis)
 python process_hit_segments.py
 
 # Full run + visualise 20 random successful segments
 python process_hit_segments.py --vis_count 20
 
-# Full run + visualise all successful segments
-python process_hit_segments.py --vis_count -1
+# Full run + visualise all successful + 10 random failure segments
+python process_hit_segments.py --vis_count -1 --fail_vis_count 10
+
+# Resume an interrupted run (already-written JSONs are skipped automatically)
+python process_hit_segments.py
 
 # Standalone: re-run success vis from annotation JSONs (no re-filtering)
 python process_hit_segments.py --vis_only --vis_count 20
-
-# Custom output dir for success vis clips
-python process_hit_segments.py --vis_count 20 --vis_out_dir /path/to/vis_out
 ```
 
 ### CLI Options
@@ -54,8 +62,8 @@ python process_hit_segments.py --vis_count 20 --vis_out_dir /path/to/vis_out
 | Option | Default | Description |
 |---|---|---|
 | `--vis_count` | `0` | Success clips to render: `0`=none, `N`=random N, `-1`=all |
-| `--vis_out_dir` | `./vis_out` | Directory for success visualisation videos |
-| `--vis_only` | off | Skip filtering; load `vis_segments_cache.json` and render vis only |
+| `--fail_vis_count` | `0` | Failure clips to render: `0`=none, `N`=random N, `-1`=all |
+| `--vis_only` | off | Skip filtering; reconstruct vis segments from annotation JSONs and render success vis only |
 
 ## Output
 
@@ -67,14 +75,14 @@ output_hit_segments_2k5/
 │                                  # bounding_boxes populated only for stage-3 passing segments
 ├── stats.json                     # success/failure counts by stage
 ├── failure_cases.json             # all failure records
-├── failure_vis/
+├── failure_vis/                   # (if --fail_vis_count != 0)
 │   ├── stage1_duration/           # raw clips of short segments
 │   ├── stage2_no_new_card/        # clips with start(blue)/end(green) det overlays
 │   ├── stage2_no_detections/
 │   ├── stage2_bad_frame_order/
 │   └── stage3_spatial/            # clips with rejected cards(red) + constraint region(orange)
 │
-└── (vis_out/ or --vis_out_dir)    # success vis clips (if --vis_count != 0)
+└── success_vis/                   # (if --vis_count != 0)
 ```
 
 ### Annotation JSON format
@@ -113,3 +121,92 @@ output_hit_segments_2k5/
 ```
 
 `x/y/width/height` are percentages of 1280×720. `bounding_boxes` is `[]` for segments that failed stage 2 or 3.
+
+---
+
+## Call for Action (`process_call_for_action_segments.py`)
+
+Extracts `call for action` segments with bounding boxes determined by index-finger-tip proximity to card centroids using dwpose hand tracking.
+
+Supports **resuming after interruption**: already-written annotation JSONs are skipped on re-run.
+
+### Filtering Pipeline
+
+```
+all segments
+    │
+    ▼
+Stage 1 – duration
+    Keep call-for-action with >= 45 frames.
+    │
+    ▼
+Stage 2 – pose sampling
+    Load dwpose pkl; sample every 5 frames within segment.
+    Extract index finger tip (keypoint 8) for both hands.
+    Look up card detections at each sampled frame (±2 frame fallback).
+    Only consider cards with centroid y > 450 px.
+    Fail if no frame has both hands detected + eligible card detections.
+    │
+    ▼
+Stage 3 – card vote (two-criterion selection)
+    C1  = card nearest to a finger tip most often across sampled frames (vote winner).
+    C2  = card with globally smallest distance to any tip in any frame.
+    C_final = C2 if Dmin_global < Dmin_C1 and C1 ≠ C2 (>20 px apart);
+              C1 otherwise.
+    │
+    ▼
+Output annotations JSON (per video, written immediately for resume support)
+```
+
+### Usage
+
+```bash
+# Full run (filtering only, no vis)
+python process_call_for_action_segments.py
+
+# Full run + visualise 50 random successful segments
+python process_call_for_action_segments.py --vis_count 50
+
+# Full run + 20 success vis + 10 failure vis
+python process_call_for_action_segments.py --vis_count 20 --fail_vis_count 10
+
+# Resume an interrupted run (already-written JSONs are skipped automatically)
+python process_call_for_action_segments.py
+```
+
+### CLI Options
+
+| Option | Default | Description |
+|---|---|---|
+| `--vis_count` | `0` | Success clips to render: `0`=none, `N`=random N, `-1`=all |
+| `--fail_vis_count` | `0` | Failure clips to render: `0`=none, `N`=random N, `-1`=all |
+
+### Output
+
+All outputs written to `output_cfa_segments_2k5/`.
+
+```
+output_cfa_segments_2k5/
+├── <video>_annotations.json       # one per video; CFA segments >= 45 frames
+│                                  # bounding_boxes populated only for stage-3 passing segments
+├── stats.json                     # success/failure counts by stage
+├── failure_cases.json             # all failure records
+├── failure_vis/                   # (if --fail_vis_count != 0)
+│   ├── stage1_duration/
+│   ├── stage2_no_pkl/
+│   ├── stage2_no_card_jsonl/
+│   ├── stage2_no_valid_samples/
+│   └── stage3_no_votes/
+│
+└── success_vis/                   # (if --vis_count != 0)
+    # clips with: chosen card (green bbox), index tips (cyan=left, magenta=right),
+    # lines from tips to chosen centroid, all other cards (blue), vote info overlay
+```
+
+### Visualisation overlay
+
+- **Green bbox + centroid**: chosen card (C_final)
+- **Cyan dot**: left hand index finger tip (on sampled frames)
+- **Magenta dot**: right hand index finger tip (on sampled frames)
+- **Blue bboxes**: all other detected cards at that frame
+- **Top-left text**: selection method (`vote_winner` / `global_closest`), vote ratio, Dmin_C1, Dmin_global

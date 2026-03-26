@@ -8,15 +8,13 @@ Filtering pipeline (each stage is an independent function):
       dealer hits – centroid inside DEALER_BBOX_PX; if multiple, pick highest-x
       hit         – centroid y >= HIT_MIN_Y_PX;     if multiple, pick highest-y
 
-Failure cases at each stage are saved to output_hit_segments/failure_cases_{stage}.json
-and visualised under output_hit_segments/failure_vis/{stage}/.
-A summary stats.json is also written.
+Supports resuming after interruption: already-written annotation JSONs are
+skipped on re-run.
 
 Usage:
-    python process_hit_segments.py [--vis_count N|-1] [--vis_out_dir DIR]
-    --vis_count  0   no success visualisation (default)
-    --vis_count  N   visualise first N successful segments
-    --vis_count -1   visualise all successful segments
+    python process_hit_segments.py [--vis_count N] [--fail_vis_count N]
+    --vis_count       0   no success vis (default); N=random N; -1=all
+    --fail_vis_count  0   no failure vis (default); N=random N; -1=all
 """
 
 import argparse
@@ -40,6 +38,7 @@ CARDS_DIR = (
 RAW_VIDEO_DIR = "/home/ubuntu/yifan/code/FACT_actseg/Data_Filtering/filtered_videos"
 OUTPUT_DIR = Path(__file__).parent / "output_hit_segments_2k5"
 FAILURE_VIS_DIR = OUTPUT_DIR / "failure_vis"
+SUCCESS_VIS_DIR = OUTPUT_DIR / "success_vis"
 
 # ─── constants ────────────────────────────────────────────────────────────────
 IMG_W, IMG_H = 1280, 720
@@ -153,7 +152,7 @@ def make_bounding_box_entry(frame: int, det: dict) -> dict:
 # Filtering stages  (each returns (passed, failed) lists)
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def stage1_duration(segments: List[dict]) -> Tuple[List[dict], List[dict]]:
+def stage1_duration(segments: List[dict], video_name_base: str) -> Tuple[List[dict], List[dict]]:
     """Keep only hit/dealer-hits segments with >= MIN_SEGMENT_FRAMES frames."""
     passed, failed = [], []
     for seg in segments:
@@ -164,7 +163,7 @@ def stage1_duration(segments: List[dict]) -> Tuple[List[dict], List[dict]]:
             passed.append(seg)
         else:
             failed.append({
-                **_base(seg),
+                **_base(seg, video_name_base),
                 "stage": "stage1_duration",
                 "reason": f"duration={duration} < {MIN_SEGMENT_FRAMES}",
             })
@@ -184,7 +183,7 @@ def stage2_new_card(
       "start_dets", "end_dets"  (only for no_new_card_found)
     """
     if card_detections is None:
-        failed = [{**_base(seg), "stage": "stage2_no_card_jsonl",
+        failed = [{**_base(seg, video_name_base), "stage": "stage2_no_card_jsonl",
                    "reason": "card jsonl not found"}
                   for seg in segments]
         return [], failed
@@ -199,12 +198,12 @@ def stage2_new_card(
             card_detections, ef, sf, ef, prefer="before")
 
         if start_det_f is None or end_det_f is None:
-            failed.append({**_base(seg), "stage": "stage2_no_detections",
+            failed.append({**_base(seg, video_name_base), "stage": "stage2_no_detections",
                            "reason": "no card detections within segment"})
             continue
 
         if start_det_f >= end_det_f:
-            failed.append({**_base(seg), "stage": "stage2_bad_frame_order",
+            failed.append({**_base(seg, video_name_base), "stage": "stage2_bad_frame_order",
                            "reason": f"start_det({start_det_f})>=end_det({end_det_f})"})
             continue
 
@@ -214,7 +213,7 @@ def stage2_new_card(
 
         if not new_cards:
             failed.append({
-                **_base(seg), "stage": "stage2_no_new_card",
+                **_base(seg, video_name_base), "stage": "stage2_no_new_card",
                 "reason": (f"start_f{start_det_f}:{len(start_dets)}dets"
                            f"->end_f{end_det_f}:{len(end_dets)}dets"),
                 # kept for failure vis only – stripped before writing JSON
@@ -228,7 +227,7 @@ def stage2_new_card(
     return passed, failed
 
 
-def stage3_spatial(segments: List[dict]) -> Tuple[List[dict], List[dict]]:
+def stage3_spatial(segments: List[dict], video_name_base: str) -> Tuple[List[dict], List[dict]]:
     """
     Apply per-label spatial constraint and pick one card per segment.
     Passing segments get a "chosen_card" key.
@@ -246,7 +245,7 @@ def stage3_spatial(segments: List[dict]) -> Tuple[List[dict], List[dict]]:
                       and y1 <= d["polygon_center"][0][1] <= y2]
             if not inside:
                 failed.append({
-                    **_base(seg), "stage": "stage3_spatial",
+                    **_base(seg, video_name_base), "stage": "stage3_spatial",
                     "reason": (f"no centroid inside dealer bbox "
                                f"({len(new_cards)} candidates)"),
                     "_candidate_cards": new_cards,
@@ -259,7 +258,7 @@ def stage3_spatial(segments: List[dict]) -> Tuple[List[dict], List[dict]]:
                      if d["polygon_center"][0][1] >= HIT_MIN_Y_PX]
             if not below:
                 failed.append({
-                    **_base(seg), "stage": "stage3_spatial",
+                    **_base(seg, video_name_base), "stage": "stage3_spatial",
                     "reason": (f"no centroid y>={HIT_MIN_Y_PX}px "
                                f"({len(new_cards)} candidates)"),
                     "_candidate_cards": new_cards,
@@ -272,10 +271,10 @@ def stage3_spatial(segments: List[dict]) -> Tuple[List[dict], List[dict]]:
     return passed, failed
 
 
-def _base(seg: dict) -> dict:
+def _base(seg: dict, video_name_base: str) -> dict:
     """Minimal failure record fields shared across all stages."""
     return {
-        "video": seg.get("video", seg.get("video_name_base", "")),
+        "video": video_name_base,
         "label": seg["label"],
         "start_frame": seg["start_frame"],
         "end_frame": seg["end_frame"],
@@ -310,12 +309,6 @@ def _load_segment_frames(video_name_base: str, sf: int, ef: int):
         frames.append(frame)
     cap.release()
     return frames, fps
-
-
-def _load_segment_last_frame(video_name_base: str, sf: int, ef: int):
-    """Return the last frame of [sf, ef] from the raw video, or None."""
-    frames, _ = _load_segment_frames(video_name_base, sf, ef)
-    return frames[-1] if frames else None
 
 
 def _write_video(frames, out_path: str, fps: float = 25.0):
@@ -370,12 +363,6 @@ def _draw_hit_line(img):
                 cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 165, 255), 1)
 
 
-def _save(img, path: str):
-    import cv2
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    cv2.imwrite(path, img)
-
-
 def _overlay_failure(frame, stage: str, label: str, sf: int, ef: int,
                      reason: str, fc: dict):
     """Draw failure overlay onto a single frame in-place."""
@@ -396,7 +383,9 @@ def _overlay_failure(frame, stage: str, label: str, sf: int, ef: int,
             _draw_hit_line(frame)
 
 
-def visualize_failures(all_failures: List[dict]):
+def visualize_failures(all_failures: List[dict], count: int):
+    if count == 0:
+        return
     try:
         import cv2
         import numpy as np
@@ -404,12 +393,18 @@ def visualize_failures(all_failures: List[dict]):
         print("cv2 not available – skipping failure vis")
         return
 
-    for fc in all_failures:
+    pool = list(all_failures)
+    if count != -1 and count < len(pool):
+        pool = random.sample(pool, count)
+
+    total = len(pool)
+    for idx, fc in enumerate(pool, 1):
         stage = fc["stage"]
         vname = fc["video"]
         label = fc["label"]
         sf, ef = fc["start_frame"], fc["end_frame"]
         clip_label = label.replace(" ", "_")
+        print(f"  failure vis [{idx}/{total}] {vname} f{sf}-{ef} ({stage})", flush=True)
         out_path = str(FAILURE_VIS_DIR / stage / f"{clip_label}_{vname}_{sf}_{ef}.mp4")
         os.makedirs(str(FAILURE_VIS_DIR / stage), exist_ok=True)
 
@@ -431,14 +426,14 @@ def visualize_failures(all_failures: List[dict]):
             # no source clip – write a single blank frame as 2-second video
             blank = np.zeros((IMG_H, IMG_W, 3), dtype=np.uint8)
             _overlay_failure(blank, stage, label, sf, ef, reason, fc)
-            frames = [blank] * int(fps * 2)
+            frames = [blank] * max(1, int(fps * 2))
 
         for frame in frames:
             _overlay_failure(frame, stage, label, sf, ef, reason, fc)
 
         _write_video(frames, out_path, fps)
 
-    print(f"Failure vis saved under: {FAILURE_VIS_DIR}/")
+    print(f"Failure vis ({total} clips) saved under: {FAILURE_VIS_DIR}/")
 
 
 def visualize_success(vis_segments: List[dict], count: int, out_dir: str):
@@ -447,6 +442,8 @@ def visualize_success(vis_segments: List[dict], count: int, out_dir: str):
     with chosen-card bbox + constraint region overlaid on every frame.
     count=-1 visualises all.
     """
+    if count == 0:
+        return
     try:
         import cv2
         import numpy as np
@@ -460,10 +457,12 @@ def visualize_success(vis_segments: List[dict], count: int, out_dir: str):
     if count != -1 and count < len(pool):
         pool = random.sample(pool, count)
 
-    for info in pool:
+    total = len(pool)
+    for idx, info in enumerate(pool, 1):
         vname = info["video_name_base"]
         label = info["label"]
         sf, ef = info["start_frame"], info["end_frame"]
+        print(f"  success vis [{idx}/{total}] {vname} f{sf}-{ef}", flush=True)
 
         frames, fps = _load_segment_frames(vname, sf, ef)
         if not frames:
@@ -482,7 +481,7 @@ def visualize_success(vis_segments: List[dict], count: int, out_dir: str):
         out_path = os.path.join(out_dir, f"{clip_label}_{vname}_{sf}_{ef}_vis.mp4")
         _write_video(frames, out_path, fps)
 
-    print(f"Success vis ({len(pool)} clips) saved under: {out_dir}/")
+    print(f"Success vis ({total} clips) saved under: {out_dir}/")
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -521,45 +520,78 @@ def load_vis_segments_from_output(out_dir: Path) -> List[dict]:
     return vis_segs
 
 
-def process(vis_count: int = 0, vis_out_dir: str = "./vis_out") -> List[dict]:
+def _write_annotation(video_name_base: str, video_name: str,
+                      timeline_segments: List[dict]):
+    """Write a single video's annotation JSON immediately (supports resume)."""
+    record = {
+        "video_name": video_name,
+        "video_id": "",
+        "video_path": "",
+        "timeline_segments": timeline_segments,
+    }
+    out_path = OUTPUT_DIR / f"{video_name_base}_annotations.json"
+    with open(out_path, "w") as f:
+        json.dump(record, f, indent=2)
+
+
+def process(vis_count: int = 0, fail_vis_count: int = 0) -> List[dict]:
     with open(SEGMENTS_JSON) as f:
         all_segments: Dict[str, List[dict]] = json.load(f)
 
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-    FAILURE_VIS_DIR.mkdir(parents=True, exist_ok=True)
+
+    # ── detect already-processed videos for resume ────────────────────────
+    existing = {p.stem.replace("_annotations", "")
+                for p in OUTPUT_DIR.glob("*_annotations.json")}
+    if existing:
+        print(f"Resuming: {len(existing)} videos already processed, skipping them.")
 
     all_failures: List[dict] = []
-    vis_segments: List[dict] = []          # successful, ready for output
-    # {video_name: timeline_segments} accumulator
-    video_timelines: Dict[str, dict] = {}
+    vis_segments: List[dict] = []
+    video_keys = list(all_segments.keys())
+    total_videos = len(video_keys)
+    n_skipped = 0
+    n_processed = 0
 
-    for txt_key, segments in all_segments.items():
+    for vi, txt_key in enumerate(video_keys, 1):
+        segments = all_segments[txt_key]
         video_name_base = txt_key.replace(".txt", "")
         video_name = video_name_base + ".mp4"
+
+        # ── resume: skip already-written annotation JSONs ─────────────────
+        if video_name_base in existing:
+            n_skipped += 1
+            continue
+
+        # ── Stage 1: duration ─────────────────────────────────────────────
+        s1_pass, s1_fail = stage1_duration(segments, video_name_base)
+        all_failures.extend(s1_fail)
+
+        if not s1_pass:
+            # still write an empty annotation so resume skips this video
+            _write_annotation(video_name_base, video_name, [])
+            n_processed += 1
+            if n_processed % 50 == 0:
+                print(f"[{vi}/{total_videos}] {n_processed} processed, "
+                      f"{n_skipped} skipped …", flush=True)
+            continue
 
         # load card detections once per video
         card_jsonl = os.path.join(CARDS_DIR, f"{video_name_base}_card.jsonl")
         card_dets = load_card_detections(card_jsonl) if os.path.exists(card_jsonl) else None
 
-        # ── Stage 1: duration ──────────────────────────────────────────────
-        s1_pass, s1_fail = stage1_duration(segments)
-        for fc in s1_fail:
-            fc["video"] = video_name_base
-        all_failures.extend(s1_fail)
+        print(f"[{vi}/{total_videos}] {video_name_base}  "
+              f"({len(s1_pass)} hit/dealer-hits segs) …", flush=True)
 
-        # ── Stage 2: new card diff ─────────────────────────────────────────
+        # ── Stage 2: new card diff ────────────────────────────────────────
         s2_pass, s2_fail = stage2_new_card(s1_pass, card_dets, video_name_base)
-        for fc in s2_fail:
-            fc["video"] = video_name_base
         all_failures.extend(s2_fail)
 
-        # ── Stage 3: spatial filter ────────────────────────────────────────
-        s3_pass, s3_fail = stage3_spatial(s2_pass)
-        for fc in s3_fail:
-            fc["video"] = video_name_base
+        # ── Stage 3: spatial filter ───────────────────────────────────────
+        s3_pass, s3_fail = stage3_spatial(s2_pass, video_name_base)
         all_failures.extend(s3_fail)
 
-        # ── Build output timeline (hit / dealer hits only) ─────────────────
+        # ── Build output timeline (hit / dealer hits only) ────────────────
         hit_success = {(s["start_frame"], s["end_frame"]): s for s in s3_pass}
 
         timeline_segments = []
@@ -584,12 +616,8 @@ def process(vis_count: int = 0, vis_out_dir: str = "./vis_out") -> List[dict]:
                 "bounding_boxes": bboxes,
             })
 
-        video_timelines[video_name_base] = {
-            "video_name": video_name,
-            "video_id": "",
-            "video_path": "",
-            "timeline_segments": timeline_segments,
-        }
+        # write immediately so interrupted runs can resume
+        _write_annotation(video_name_base, video_name, timeline_segments)
 
         # collect for success visualisation (needs chosen_card)
         for s in s3_pass:
@@ -604,14 +632,9 @@ def process(vis_count: int = 0, vis_out_dir: str = "./vis_out") -> List[dict]:
                     s["end_det_frame"], s["chosen_card"])],
             })
 
-    # ── Write annotation JSONs ─────────────────────────────────────────────────
-    for video_name_base, record in video_timelines.items():
-        out_path = OUTPUT_DIR / f"{video_name_base}_annotations.json"
-        with open(out_path, "w") as f:
-            json.dump(record, f, indent=2)
-        print(f"Saved: {out_path}")
+        n_processed += 1
 
-    # ── Stats ──────────────────────────────────────────────────────────────────
+    # ── Stats ─────────────────────────────────────────────────────────────────
     stage_counts: Dict[str, int] = {}
     for fc in all_failures:
         stage_counts[fc["stage"]] = stage_counts.get(fc["stage"], 0) + 1
@@ -622,6 +645,7 @@ def process(vis_count: int = 0, vis_out_dir: str = "./vis_out") -> List[dict]:
         "successful": len(vis_segments),
         "failed_total": len(all_failures),
         "failed_by_stage": stage_counts,
+        "skipped_resume": n_skipped,
     }
     with open(OUTPUT_DIR / "stats.json", "w") as f:
         json.dump(stats, f, indent=2)
@@ -634,21 +658,24 @@ def process(vis_count: int = 0, vis_out_dir: str = "./vis_out") -> List[dict]:
         json.dump([_clean(fc) for fc in all_failures], f, indent=2)
 
     print(f"\nSummary: {len(vis_segments)} successful  /  "
-          f"{len(all_failures)} failed  /  {total_hit} total")
+          f"{len(all_failures)} failed  /  {total_hit} total"
+          f"  ({n_skipped} skipped from previous run)")
     for stage, cnt in sorted(stage_counts.items()):
         print(f"  {stage}: {cnt}")
     print(f"Stats   : {OUTPUT_DIR / 'stats.json'}")
     print(f"Failures: {OUTPUT_DIR / 'failure_cases.json'}")
 
-    # ── Failure visualisations (always) ────────────────────────────────────────
-    print("\nGenerating failure visualisations …")
-    visualize_failures(all_failures)
+    # ── Failure visualisation (optional) ──────────────────────────────────────
+    if fail_vis_count != 0:
+        n = len(all_failures) if fail_vis_count == -1 else fail_vis_count
+        print(f"\nGenerating {n} failure visualisations …")
+        visualize_failures(all_failures, fail_vis_count)
 
-    # ── Success visualisations (optional) ──────────────────────────────────────
+    # ── Success visualisation (optional) ──────────────────────────────────────
     if vis_count != 0:
         n = len(vis_segments) if vis_count == -1 else vis_count
-        print(f"\nGenerating {n} random success visualisations …")
-        visualize_success(vis_segments, n, vis_out_dir)
+        print(f"\nGenerating {n} success visualisations …")
+        visualize_success(vis_segments, vis_count, str(SUCCESS_VIS_DIR))
 
     return vis_segments
 
@@ -659,12 +686,11 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--vis_count", type=int, default=0,
-        help="Random successful segments to visualise: 0=none, N=random N, -1=all",
+        help="Success clips to render: 0=none (default), N=random N, -1=all",
     )
     parser.add_argument(
-        "--vis_out_dir", type=str,
-        default=str(Path(__file__).parent / "vis_out"),
-        help="Directory for success visualisation videos",
+        "--fail_vis_count", type=int, default=0,
+        help="Failure clips to render: 0=none (default), N=random N, -1=all",
     )
     parser.add_argument(
         "--vis_only", action="store_true",
@@ -679,6 +705,6 @@ if __name__ == "__main__":
         vis_segs = load_vis_segments_from_output(OUTPUT_DIR)
         n = len(vis_segs) if args.vis_count == -1 else args.vis_count
         print(f"Loaded {len(vis_segs)} segments from annotation JSONs. Visualising {n} …")
-        visualize_success(vis_segs, n, args.vis_out_dir)
+        visualize_success(vis_segs, args.vis_count, str(SUCCESS_VIS_DIR))
     else:
-        process(vis_count=args.vis_count, vis_out_dir=args.vis_out_dir)
+        process(vis_count=args.vis_count, fail_vis_count=args.fail_vis_count)
