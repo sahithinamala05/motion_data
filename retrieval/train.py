@@ -1,5 +1,5 @@
 """
-Train SplitDetector (MLP + classifier) with joint CE + triplet loss.
+Train ActionDetector (MLP + classifier) with joint CE + triplet loss.
 
 v3 — window-level training (matches inference distribution):
   - Trains on sliding windows from annotated videos (same window/stride as inference)
@@ -8,10 +8,14 @@ v3 — window-level training (matches inference distribution):
   - MLP encoder + multi-class CE + triplet loss
   - Balanced sampling, feature dropout
 
+Supports any action label in ALL_LABELS. Window/stride auto-computed from
+the target action's segment length distribution if not specified.
+
 Usage:
-    python train.py                 # CV + final model
-    python train.py --epochs 300
-    python train.py --no_cv         # skip CV, just train final model
+    python train.py --action split
+    python train.py --action "clean hand"
+    python train.py --action hit --window 40 --stride 10   # manual override
+    python train.py --action split --no_cv
 """
 
 import argparse
@@ -29,14 +33,36 @@ from dataset import (
     build_window_dataset,
 )
 from triplet_retrieval import SplitDetector, train_detector, project_items
-from inference import build_split_gallery
 
 CKPT_DIR = Path(__file__).parent / "checkpoints"
 SEED     = 42
-
 N_BINS   = 5       # temporal bins
-WINDOW   = 60      # sliding window size (frames) — must match inference
-STRIDE   = 15      # sliding window stride — must match inference
+
+
+def auto_window_stride(videos, action: str):
+    """Compute window and stride from the action's segment length distribution.
+
+    window ≈ 75th percentile of segment lengths (rounded up to nearest 5)
+    stride ≈ window // 4
+    """
+    lengths = []
+    for v in videos:
+        T = v["features"].shape[0]
+        for s in v["segments"]:
+            if s["label"] == action:
+                length = min(s["end_frame"], T) - s["start_frame"]
+                if length > 0:
+                    lengths.append(length)
+    if not lengths:
+        raise ValueError(f"No segments found for action '{action}'")
+    lengths = np.array(lengths)
+    p75 = int(np.percentile(lengths, 75))
+    window = max(10, int(np.ceil(p75 / 5) * 5))  # round up to nearest 5
+    stride = max(2, window // 4)
+    print(f"  Auto window/stride for '{action}': "
+          f"median={np.median(lengths):.0f}  p75={p75}  "
+          f"→ window={window}  stride={stride}")
+    return window, stride
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -52,8 +78,10 @@ def set_seeds(seed: int):
     torch.backends.cudnn.benchmark = False
 
 
-def ckpt_path(embed_dim: int, epochs: int, margin: float, seed: int) -> Path:
-    return CKPT_DIR / f"detector_v3_d{embed_dim}_e{epochs}_m{margin}_s{seed}.pt"
+def ckpt_path(action: str, embed_dim: int, epochs: int, margin: float,
+              seed: int) -> Path:
+    tag = action.replace(" ", "_")
+    return CKPT_DIR / f"detector_{tag}_d{embed_dim}_e{epochs}_m{margin}_s{seed}.pt"
 
 
 def _to_python(obj):
@@ -75,26 +103,29 @@ def _to_python(obj):
 # Stratified k-fold split at video level
 # ─────────────────────────────────────────────────────────────────────────────
 
-def stratified_kfold_videos(all_videos: list, k: int = 5, seed: int = SEED):
+def stratified_kfold_videos(all_videos: list, action: str,
+                            k: int = 5, seed: int = SEED):
+    """Stratified k-fold at video level: ensures action-containing videos
+    are evenly distributed across folds."""
     rng = np.random.default_rng(seed)
-    split_vids = [v for v in all_videos if any(
-        s.get("label") == "split" for s in v.get("segments", [])
+    action_vids = [v for v in all_videos if any(
+        s.get("label") == action for s in v.get("segments", [])
     )]
-    other_vids = [v for v in all_videos if v not in split_vids]
+    other_vids = [v for v in all_videos if v not in action_vids]
 
-    rng.shuffle(split_vids)
+    rng.shuffle(action_vids)
     rng.shuffle(other_vids)
 
-    split_folds = [split_vids[i::k] for i in range(k)]
+    action_folds = [action_vids[i::k] for i in range(k)]
     other_folds = [other_vids[i::k] for i in range(k)]
 
     folds = []
     for i in range(k):
-        val   = split_folds[i] + other_folds[i]
+        val   = action_folds[i] + other_folds[i]
         train = []
         for j in range(k):
             if j != i:
-                train += split_folds[j] + other_folds[j]
+                train += action_folds[j] + other_folds[j]
         folds.append((train, val))
     return folds
 
@@ -103,9 +134,9 @@ def stratified_kfold_videos(all_videos: list, k: int = 5, seed: int = SEED):
 # Classifier evaluation (P/R/F1 at various thresholds)
 # ─────────────────────────────────────────────────────────────────────────────
 
-def evaluate_classifier(model, val_items, focus_label="split",
+def evaluate_classifier(model, val_items, focus_label,
                         thresholds=(0.5, 0.7, 0.8, 0.9, 0.95)):
-    """Evaluate split detection P/R/F1 on validation windows."""
+    """Evaluate action detection P/R/F1 on validation windows."""
     model.eval()
     feats = np.stack([it["feat"] for it in val_items]).astype(np.float32)
     labels = np.array([it["label_id"] for it in val_items])
@@ -152,25 +183,25 @@ def evaluate_classifier(model, val_items, focus_label="split",
 # Single train+eval pass (used by CV and final training)
 # ─────────────────────────────────────────────────────────────────────────────
 
-def train_and_eval(train_vids, val_vids, n_bins: int,
+def train_and_eval(train_vids, val_vids, action: str, n_bins: int,
                    window: int, stride: int,
                    embed_dim: int, epochs: int, lr: float,
                    margin: float, batch_size: int,
                    triplet_weight: float, feat_dropout: float,
                    fold_idx: int = None, seed: int = SEED):
-    """Train a SplitDetector on sliding windows, evaluate on val windows."""
+    """Train an ActionDetector on sliding windows, evaluate on val windows."""
     tr_items = build_window_dataset(
         train_vids, window=window, stride=stride, n_bins=n_bins,
-        min_overlap_frac=0.5)
+        min_overlap_frac=0.5, focus_label=action)
     va_items = build_window_dataset(
         val_vids, window=window, stride=stride, n_bins=n_bins,
-        min_overlap_frac=0.5)
+        min_overlap_frac=0.5, focus_label=action)
 
-    split_id = LABEL2ID["split"]
-    n_tr_split = sum(1 for it in tr_items if it["label_id"] == split_id)
-    n_va_split = sum(1 for it in va_items if it["label_id"] == split_id)
+    action_id = LABEL2ID[action]
+    n_tr_action = sum(1 for it in tr_items if it["label_id"] == action_id)
+    n_va_action = sum(1 for it in va_items if it["label_id"] == action_id)
 
-    if n_va_split == 0:
+    if n_va_action == 0:
         return None
 
     in_dim = tr_items[0]["feat"].shape[0]
@@ -180,17 +211,17 @@ def train_and_eval(train_vids, val_vids, n_bins: int,
         tr_items, in_dim=in_dim, embed_dim=embed_dim, n_classes=n_classes,
         epochs=epochs, lr=lr, margin=margin, batch_size=batch_size,
         triplet_weight=triplet_weight, feat_dropout=feat_dropout,
-        focus_label="split",
+        focus_label=action,
     )
 
-    results = evaluate_classifier(model, va_items)
+    results = evaluate_classifier(model, va_items, focus_label=action)
 
     prefix = f"Fold {fold_idx}" if fold_idx is not None else "Final"
     print(f"  {prefix:8s}  "
           f"acc={results['accuracy']:.3f}  "
           f"P@0.9={results['P@0.9']:.3f}  R@0.9={results['R@0.9']:.3f}  "
           f"F1@0.9={results['F1@0.9']:.3f}  "
-          f"(n_split_win={n_va_split}/{results['n_val']})")
+          f"(n_{action}_win={n_va_action}/{results['n_val']})")
 
     return results, model
 
@@ -199,15 +230,18 @@ def train_and_eval(train_vids, val_vids, n_bins: int,
 # Main
 # ─────────────────────────────────────────────────────────────────────────────
 
-def train(embed_dim: int = 256, epochs: int = 300, lr: float = 3e-3,
-          margin: float = 0.3, batch_size: int = 64,
+def train(action: str = "split", embed_dim: int = 256, epochs: int = 300,
+          lr: float = 3e-3, margin: float = 0.3, batch_size: int = 64,
           triplet_weight: float = 0.5, feat_dropout: float = 0.15,
-          n_bins: int = N_BINS, window: int = WINDOW, stride: int = STRIDE,
+          n_bins: int = N_BINS, window: int = None, stride: int = None,
           seed: int = SEED, k_folds: int = 5, run_cv: bool = True):
+
+    if action not in LABEL2ID:
+        raise ValueError(f"Unknown action '{action}'. Choose from: {ALL_LABELS}")
 
     set_seeds(seed)
     CKPT_DIR.mkdir(parents=True, exist_ok=True)
-    out_path = ckpt_path(embed_dim, epochs, margin, seed)
+    out_path = ckpt_path(action, embed_dim, epochs, margin, seed)
 
     if out_path.exists():
         print(f"Checkpoint already exists: {out_path}")
@@ -215,24 +249,33 @@ def train(embed_dim: int = 256, epochs: int = 300, lr: float = 3e-3,
         return out_path
 
     print(f"Device: {torch.device('cuda' if torch.cuda.is_available() else 'cpu')}")
+    print(f"Action: {action}")
+
+    all_videos   = load_all_videos()
+    action_videos = filter_videos_with_label(all_videos, action)
+    print(f"Videos containing '{action}': {len(action_videos)}")
+
+    # Auto-compute window/stride from segment lengths if not specified
+    if window is None or stride is None:
+        auto_w, auto_s = auto_window_stride(all_videos, action)
+        window = window or auto_w
+        stride = stride or auto_s
+
     print(f"Seed={seed}  embed_dim={embed_dim}  epochs={epochs}  "
           f"margin={margin}  n_bins={n_bins}")
     print(f"Window={window}  stride={stride}  "
           f"triplet_weight={triplet_weight}  feat_dropout={feat_dropout}")
 
-    all_videos   = load_all_videos()
-    split_videos = filter_videos_with_label(all_videos, "split")
-    print(f"Split-containing videos: {len(split_videos)}")
-
     # ── Cross-validation ─────────────────────────────────────────────────────
     if run_cv:
         print(f"\n── {k_folds}-fold stratified CV (window-level) ──")
-        folds = stratified_kfold_videos(split_videos, k=k_folds, seed=seed)
+        folds = stratified_kfold_videos(action_videos, action=action,
+                                        k=k_folds, seed=seed)
         cv_results = []
         for i, (tr_vids, va_vids) in enumerate(folds):
             set_seeds(seed + i)
             ret = train_and_eval(
-                tr_vids, va_vids, n_bins=n_bins,
+                tr_vids, va_vids, action=action, n_bins=n_bins,
                 window=window, stride=stride,
                 embed_dim=embed_dim, epochs=epochs, lr=lr,
                 margin=margin, batch_size=batch_size,
@@ -246,14 +289,13 @@ def train(embed_dim: int = 256, epochs: int = 300, lr: float = 3e-3,
                 vals = [r[key] for r in cv_results]
                 print(f"  Mean {key}: {np.mean(vals):.3f} ± {np.std(vals):.3f}")
 
-    # ── Final model — train on ALL 634 annotated videos ─────────────────────
-    # 586 non-split videos provide diverse negatives from the same blackjack
-    # domain, teaching the model "these common actions are NOT split".
+    # ── Final model — train on ALL annotated videos ──────────────────────────
+    # Non-action videos provide diverse negatives from the same domain.
     print(f"\n── Training final model (all {len(all_videos)} annotated videos) ──")
     set_seeds(seed)
     all_items = build_window_dataset(
         all_videos, window=window, stride=stride, n_bins=n_bins,
-        min_overlap_frac=0.5)   # stricter: window must be majority-split
+        min_overlap_frac=0.5, focus_label=action)
 
     c = Counter(it["label"] for it in all_items)
     print(f"  Window labels: {dict(c)}")
@@ -266,22 +308,22 @@ def train(embed_dim: int = 256, epochs: int = 300, lr: float = 3e-3,
         all_items, in_dim=in_dim, embed_dim=embed_dim, n_classes=n_classes,
         epochs=epochs, lr=lr, margin=margin, batch_size=batch_size,
         triplet_weight=triplet_weight, feat_dropout=feat_dropout,
-        focus_label="split",
+        focus_label=action,
     )
 
     # Evaluate on training windows (sanity check)
-    train_results = evaluate_classifier(model, all_items)
+    train_results = evaluate_classifier(model, all_items, focus_label=action)
     print(f"  Train acc={train_results['accuracy']:.3f}  "
           f"P@0.9={train_results['P@0.9']:.3f}  "
           f"R@0.9={train_results['R@0.9']:.3f}")
 
-    # Build split gallery for visualisation at inference
-    split_items = [it for it in all_items if it["label"] == "split"]
-    gallery_feats = project_items(model, split_items)
+    # Build gallery for visualisation at inference
+    action_items = [it for it in all_items if it["label"] == action]
+    gallery_feats = project_items(model, action_items)
     gallery_npy = out_path.with_suffix(".gallery.npy")
     np.save(gallery_npy, gallery_feats)
 
-    train_video_ids = [v["video_id"] for v in all_videos]
+    train_video_names = [v["video_name"] for v in all_videos]
     torch.save({
         "model_state":  model.state_dict(),
         "model_type":   "SplitDetector",
@@ -289,8 +331,9 @@ def train(embed_dim: int = 256, epochs: int = 300, lr: float = 3e-3,
         "embed_dim":    embed_dim,
         "n_classes":    n_classes,
         "n_bins":       n_bins,
-        "gallery_items": _to_python(split_items),
-        "train_video_ids": train_video_ids,
+        "action":       action,
+        "gallery_items": _to_python(action_items),
+        "train_video_names": train_video_names,
         "hparams": dict(epochs=epochs, lr=lr, margin=margin,
                         batch_size=batch_size, triplet_weight=triplet_weight,
                         feat_dropout=feat_dropout, seed=seed,
@@ -298,12 +341,14 @@ def train(embed_dim: int = 256, epochs: int = 300, lr: float = 3e-3,
     }, out_path)
 
     print(f"\nCheckpoint:    {out_path}")
-    print(f"Split gallery: {gallery_npy}  ({len(split_items)} windows)")
+    print(f"Gallery:       {gallery_npy}  ({len(action_items)} windows)")
     return out_path
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
+    parser.add_argument("--action",         type=str,   default="split",
+                        help=f"Target action label. Choices: {ALL_LABELS}")
     parser.add_argument("--embed_dim",      type=int,   default=256)
     parser.add_argument("--epochs",         type=int,   default=300)
     parser.add_argument("--lr",             type=float, default=3e-3)
@@ -312,15 +357,17 @@ if __name__ == "__main__":
     parser.add_argument("--triplet_weight", type=float, default=0.5)
     parser.add_argument("--feat_dropout",   type=float, default=0.15)
     parser.add_argument("--n_bins",         type=int,   default=N_BINS)
-    parser.add_argument("--window",         type=int,   default=WINDOW)
-    parser.add_argument("--stride",         type=int,   default=STRIDE)
+    parser.add_argument("--window",         type=int,   default=None,
+                        help="Sliding window size (auto from data if omitted)")
+    parser.add_argument("--stride",         type=int,   default=None,
+                        help="Sliding window stride (auto from data if omitted)")
     parser.add_argument("--seed",           type=int,   default=SEED)
     parser.add_argument("--folds",          type=int,   default=5)
     parser.add_argument("--no_cv",          action="store_true")
     args = parser.parse_args()
 
-    train(embed_dim=args.embed_dim, epochs=args.epochs, lr=args.lr,
-          margin=args.margin, batch_size=args.batch_size,
+    train(action=args.action, embed_dim=args.embed_dim, epochs=args.epochs,
+          lr=args.lr, margin=args.margin, batch_size=args.batch_size,
           triplet_weight=args.triplet_weight, feat_dropout=args.feat_dropout,
           n_bins=args.n_bins, window=args.window, stride=args.stride,
           seed=args.seed, k_folds=args.folds, run_cv=not args.no_cv)

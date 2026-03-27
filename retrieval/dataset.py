@@ -28,7 +28,8 @@ def load_all_videos(anno_dir: Path = ANNO_DIR, feat_dir: Path = FEAT_DIR):
     """
     Returns a list of dicts, one per video that has both annotation and feature file:
         {
-            "video_id": str,           # e.g. "2025-10-01_06-05-15_000484_003464"
+            "video_name": str,         # e.g. "2025-10-01_06-05-15_000484_003464"
+            "video_id": int/str,       # numeric ID from annotation JSON (e.g. 245265322)
             "segments": [              # from timeline_segments
                 {"start_frame": int, "end_frame": int, "label": str}
             ],
@@ -40,8 +41,8 @@ def load_all_videos(anno_dir: Path = ANNO_DIR, feat_dir: Path = FEAT_DIR):
     missing_feat = 0
 
     for af in anno_files:
-        video_id = af.name.replace("_annotations.json", "")
-        feat_path = feat_dir / f"{video_id}.npy"
+        video_name = af.name.replace("_annotations.json", "")
+        feat_path = feat_dir / f"{video_name}.npy"
         if not feat_path.exists():
             missing_feat += 1
             continue
@@ -63,8 +64,10 @@ def load_all_videos(anno_dir: Path = ANNO_DIR, feat_dir: Path = FEAT_DIR):
         if not segments:
             continue
 
+        video_id = anno.get("video_id", "")  # numeric ID from annotation
         features = np.load(feat_path)  # (T, 768)
         videos.append({
+            "video_name": video_name,
             "video_id": video_id,
             "segments": segments,
             "features": features,
@@ -98,6 +101,7 @@ def build_frame_dataset(videos, stride: int = 5):
             for idx in indices:
                 frames.append({
                     "video_id": v["video_id"],
+                    "video_name": v["video_name"],
                     "frame_idx": idx,
                     "label": seg["label"],
                     "label_id": LABEL2ID[seg["label"]],
@@ -125,6 +129,7 @@ def build_segment_dataset(videos):
             feat = chunk.mean(axis=0)
             segments.append({
                 "video_id": v["video_id"],
+                "video_name": v["video_name"],
                 "frame_idx": (s + e) // 2,
                 "label": seg["label"],
                 "label_id": LABEL2ID[seg["label"]],
@@ -177,7 +182,7 @@ def build_temporal_segment_dataset(videos, n_bins: int = 3):
             feat = np.concatenate(bin_feats, axis=0)  # (n_bins * 768,)
             segments.append({
                 "video_id": v["video_id"],
-                "video_name": v["video_id"] + ".mp4",
+                "video_name": v["video_name"],
                 "start_frame": s,
                 "end_frame": e,
                 "frame_idx": (s + e) // 2,
@@ -229,7 +234,7 @@ def build_augmented_temporal_dataset(videos, n_bins=5, n_augments=3,
                 feat = np.concatenate(bin_feats, axis=0)
                 segments.append({
                     "video_id": v["video_id"],
-                    "video_name": v["video_id"] + ".mp4",
+                    "video_name": v["video_name"],
                     "start_frame": bs,
                     "end_frame": be,
                     "label": seg["label"],
@@ -241,12 +246,12 @@ def build_augmented_temporal_dataset(videos, n_bins=5, n_augments=3,
 
 
 def build_window_dataset(videos, window=60, stride=15, n_bins=5,
-                         min_overlap_frac=0.3):
+                         min_overlap_frac=0.3, focus_label="split"):
     """
     Build training data from sliding windows — matches inference distribution exactly.
 
     Each window is labeled based on overlap with annotated segments:
-      - "split" if ≥ min_overlap_frac of window overlaps a split segment
+      - focus_label if ≥ min_overlap_frac of window overlaps a focus segment
       - Otherwise the label with highest overlap
       - "discard" if no annotation covers ≥ min_overlap_frac of window
     """
@@ -272,11 +277,11 @@ def build_window_dataset(videos, window=60, stride=15, n_bins=5,
                     lbl = seg["label"]
                     overlaps[lbl] = overlaps.get(lbl, 0) + overlap
 
-            # Assign label — split gets priority when overlap is significant
+            # Assign label — focus_label gets priority when overlap is significant
             if not overlaps:
                 label = "discard"
-            elif overlaps.get("split", 0) >= min_overlap:
-                label = "split"
+            elif overlaps.get(focus_label, 0) >= min_overlap:
+                label = focus_label
             else:
                 best = max(overlaps, key=overlaps.get)
                 label = best if overlaps[best] >= min_overlap else "discard"
@@ -299,7 +304,7 @@ def build_window_dataset(videos, window=60, stride=15, n_bins=5,
                 "label":       label,
                 "label_id":    LABEL2ID[label],
                 "video_id":    v["video_id"],
-                "video_name":  v["video_id"] + ".mp4",
+                "video_name":  v["video_name"],
                 "start_frame": w_start,
                 "end_frame":   w_end,
                 "n_bins":      n_bins,

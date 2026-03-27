@@ -1,16 +1,16 @@
 """
-Sliding-window split detection on new, unannotated videos.
+Sliding-window action detection on new, unannotated videos.
 
-v2 — classifier-based scoring:
-  1. Load trained SplitDetector (MLP + classifier).
+  1. Load trained ActionDetector (MLP + classifier).
   2. Slide a fixed-length window over each new video.
-  3. Compute P(split) from the classifier for each window.
+  3. Compute P(action) from the classifier for each window.
   4. Pick top-N windows (NMS) above confidence threshold.
   5. Extract side-by-side H.264 clips for high-confidence detections.
 
 Usage:
+    python inference.py --ckpt checkpoints/detector_split_d256_e300_m0.3_s42.pt
+    python inference.py --ckpt checkpoints/detector_clean_hand_d256_e300_m0.3_s42.pt
     python inference.py --feat_dir DATA/feat/ --video_dir DATA/video/
-    python inference.py --conf_threshold 0.9
 """
 
 import argparse
@@ -34,10 +34,9 @@ from triplet_retrieval import SplitDetector, ProjectionHead
 # ─────────────────────────────────────────────────────────────────────────────
 FEAT_DIR  = Path("/home/ubuntu/yifan/code/FACT_actseg/Data_Filtering/filtered_videos_feat")
 VIDEO_DIR = Path("/home/ubuntu/yifan/code/FACT_actseg/Data_Filtering/filtered_videos")
-OUT_DIR     = Path(__file__).parent / "vis_out" / "inference"
 DEVICE      = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-CONF_THRESHOLD = 0.9     # P(split) threshold — clean probability, [0,1]
+CONF_THRESHOLD = 0.9     # P(action) threshold — clean probability, [0,1]
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Temporal feature helpers
@@ -105,14 +104,18 @@ def build_split_gallery(model, train_items):
 # ─────────────────────────────────────────────────────────────────────────────
 
 def score_video(feat_path: Path, model, gallery_feats: np.ndarray = None,
-                window: int = 60, stride: int = 15, n_bins: int = 5):
+                window: int = 60, stride: int = 15, n_bins: int = 5,
+                action_id: int = None):
     """
     Returns:
         starts, ends  : (N,) int arrays
-        scores        : (N,) float — P(split) from classifier (or cosine sim for legacy)
+        scores        : (N,) float — P(action) from classifier
         best_gal_idx  : (N,) int   — index of closest gallery item per window (or None)
         win_proj      : (N, embed_dim) projected window features
     """
+    if action_id is None:
+        action_id = LABEL2ID["split"]
+
     model.eval()
     feat = np.load(feat_path)   # (T, 768)
 
@@ -126,7 +129,6 @@ def score_video(feat_path: Path, model, gallery_feats: np.ndarray = None,
 
     raw_np = np.stack(raw_feats).astype(np.float32)
 
-    split_id = LABEL2ID["split"]
     all_probs = []
     all_emb = []
     is_detector = isinstance(model, SplitDetector)
@@ -138,11 +140,10 @@ def score_video(feat_path: Path, model, gallery_feats: np.ndarray = None,
                 emb, logits = model(chunk)
                 probs = torch.softmax(logits, dim=-1)
                 all_probs.append(
-                    np.array(probs[:, split_id].tolist(), dtype=np.float32))
+                    np.array(probs[:, action_id].tolist(), dtype=np.float32))
                 all_emb.append(
                     np.array(emb.tolist(), dtype=np.float32))
             else:
-                # Legacy: ProjectionHead
                 proj = model(chunk)
                 all_emb.append(
                     np.array(proj.tolist(), dtype=np.float32))
@@ -152,14 +153,12 @@ def score_video(feat_path: Path, model, gallery_feats: np.ndarray = None,
     if is_detector:
         scores = np.concatenate(all_probs)
     else:
-        # Legacy fallback: cosine sim to gallery
         if gallery_feats is not None:
             sims = win_proj @ gallery_feats.T
             scores = sims.max(axis=1)
         else:
             scores = np.zeros(len(win_proj))
 
-    # Gallery match for visualization
     best_gal_idx = None
     if gallery_feats is not None:
         sims = win_proj @ gallery_feats.T
@@ -235,14 +234,18 @@ def visualize_timeline(
     starts: np.ndarray, ends: np.ndarray,
     scores: np.ndarray, det_indices: list,
     total_frames: int,
-    save_dir: Path = OUT_DIR,
+    action: str = "split",
+    save_dir: Path = None,
 ):
-    """Plot P(split) timeline with detections highlighted."""
+    """Plot P(action) timeline with detections highlighted."""
+    if save_dir is None:
+        action_tag = action.replace(" ", "_")
+        save_dir = Path(__file__).parent / "vis_out" / f"inference_{action_tag}"
     save_dir.mkdir(parents=True, exist_ok=True)
     mid = (starts + ends) / 2
 
     fig, ax = plt.subplots(figsize=(14, 3.5))
-    ax.plot(mid, scores, color="#5b9bd5", lw=0.9, alpha=0.7, label="P(split)")
+    ax.plot(mid, scores, color="#5b9bd5", lw=0.9, alpha=0.7, label=f"P({action})")
     ax.fill_between(mid, scores, alpha=0.18, color="#5b9bd5")
 
     thresh = scores[det_indices].min() if det_indices else scores.max()
@@ -258,8 +261,8 @@ def visualize_timeline(
     ax.set_xlim(0, total_frames)
     ax.set_ylim(-0.05, 1.05)
     ax.set_xlabel("frame index")
-    ax.set_ylabel("P(split)")
-    ax.set_title(f"Split detection timeline — {video_id}")
+    ax.set_ylabel(f"P({action})")
+    ax.set_title(f"{action} detection timeline — {video_id}")
     ax.legend(fontsize=8, loc="upper left")
     ax.grid(alpha=0.25)
     plt.tight_layout()
@@ -279,9 +282,10 @@ def extract_clips(
     scores: np.ndarray, best_gal_idx,
     gallery_items: list,
     det_indices: list,
+    action: str = "split",
     conf_threshold: float = CONF_THRESHOLD,
     pad_frames: int = 15,
-    save_dir: Path = OUT_DIR,
+    save_dir: Path = None,
     video_dir: Path = None,
 ):
     """
@@ -290,6 +294,9 @@ def extract_clips(
       2. Extract the matched gallery clip
       3. Stitch side-by-side
     """
+    if save_dir is None:
+        action_tag = action.replace(" ", "_")
+        save_dir = Path(__file__).parent / "vis_out" / f"inference_{action_tag}"
     save_dir.mkdir(parents=True, exist_ok=True)
     video_dir = video_dir or VIDEO_DIR
     query_video = video_dir / f"{video_id}.mp4"
@@ -305,7 +312,7 @@ def extract_clips(
     for rank, di in enumerate(det_indices):
         score = float(scores[di])
         if score < conf_threshold:
-            print(f"    [skip] #{rank+1} P(split)={score:.3f} < {conf_threshold}")
+            print(f"    [skip] #{rank+1} P({action})={score:.3f} < {conf_threshold}")
             continue
 
         s, e = int(starts[di]), int(ends[di])
@@ -327,7 +334,7 @@ def extract_clips(
                 g_tmp = tmp_dir / f"{stem}_gallery.mp4"
                 extract_clip_ffmpeg(gallery_video, g_start, g_end, g_tmp,
                                     fps=g_fps, pad_frames=pad_frames)
-                label = f"P(split)={score:.3f}  |  gallery: {g_item['label']}"
+                label = f"P({action})={score:.3f}  |  gallery: {g_item['label']}"
                 out_path = save_dir / f"{stem}_sidebyside.mp4"
                 make_sidebyside_ffmpeg(q_tmp, g_tmp, out_path,
                                        label_text=label)
@@ -353,7 +360,10 @@ def extract_clips(
 # ─────────────────────────────────────────────────────────────────────────────
 
 def load_checkpoint(ckpt: Path):
-    """Load model and gallery from checkpoint. Returns (model, gallery_feats, gallery_items, n_bins)."""
+    """Load model and gallery from checkpoint.
+
+    Returns (model, gallery_feats, gallery_items, n_bins, train_video_ids, action).
+    """
     data = torch.load(ckpt, map_location="cpu", weights_only=False)
     model_type = data.get("model_type", "ProjectionHead")
 
@@ -366,23 +376,26 @@ def load_checkpoint(ckpt: Path):
     model.to(DEVICE).eval()
 
     n_bins = data.get("n_bins", 3)
+    action = data.get("action", "split")  # backward compat with old checkpoints
     gallery_feats = np.load(ckpt.with_suffix(".gallery.npy"))
+    # Backward compat: old checkpoints use "train_video_ids", new use "train_video_names"
+    train_video_names = set(
+        data.get("train_video_names", data.get("train_video_ids", [])))
 
-    train_video_ids = set(data.get("train_video_ids", []))
-
-    print(f"Loaded checkpoint: {ckpt.name}  (type={model_type})")
-    print(f"  hparams: {data['hparams']}")
-    print(f"  n_bins={n_bins}  split gallery: {len(data['gallery_items'])} segments")
-    if train_video_ids:
-        print(f"  train videos: {len(train_video_ids)} (will skip at inference)")
-    return model, gallery_feats, data["gallery_items"], n_bins, train_video_ids
+    hparams = data.get("hparams", {})
+    print(f"Loaded checkpoint: {ckpt.name}  (action={action})")
+    print(f"  hparams: {hparams}")
+    print(f"  n_bins={n_bins}  gallery: {len(data['gallery_items'])} segments")
+    if train_video_names:
+        print(f"  train videos: {len(train_video_names)} (will skip at inference)")
+    return model, gallery_feats, data["gallery_items"], n_bins, train_video_names, action
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Main
 # ─────────────────────────────────────────────────────────────────────────────
 
-def run(ckpt: Path, window: int = 60, stride: int = 15, topn: int = 1,
+def run(ckpt: Path, window: int = None, stride: int = None, topn: int = 1,
         feat_dir: Path = None, video_dir: Path = None,
         conf_threshold: float = CONF_THRESHOLD):
 
@@ -394,28 +407,54 @@ def run(ckpt: Path, window: int = 60, stride: int = 15, topn: int = 1,
 
     # ── Load checkpoint ───────────────────────────────────────────────────────
     print("\n[1/3] Loading checkpoint...")
-    model, gallery_feats, gallery_items, n_bins, train_ids = load_checkpoint(ckpt)
+    model, gallery_feats, gallery_items, n_bins, train_names, action = \
+        load_checkpoint(ckpt)
+    action_id = LABEL2ID[action]
+
+    # Use window/stride from checkpoint hparams if not specified
+    data = torch.load(ckpt, map_location="cpu", weights_only=False)
+    hparams = data.get("hparams", {})
+    if window is None:
+        window = hparams.get("window", 60)
+    if stride is None:
+        stride = hparams.get("stride", 15)
+
+    # Load full video_name → task_id mapping (all 2545 videos)
+    id_map_path = Path(__file__).resolve().parent.parent / \
+        "manual_label" / "anno" / "video_name_to_id.json"
+    if id_map_path.exists():
+        with open(id_map_path) as f:
+            name_to_task_id = json.load(f)
+        print(f"  Loaded task ID mapping: {len(name_to_task_id)} videos")
+    else:
+        name_to_task_id = {}
+        print(f"  WARNING: {id_map_path} not found — task_id will be null")
+
+    # Action-specific output directory
+    action_tag = action.replace(" ", "_")
+    out_dir = Path(__file__).parent / "vis_out" / f"inference_{action_tag}"
 
     # ── Score new videos ─────────────────────────────────────────────────────
-    print(f"\n[2/3] Scoring new videos (window={window}, stride={stride}, "
-          f"n_bins={n_bins})...")
+    print(f"\n[2/3] Scoring new videos (action={action}, window={window}, "
+          f"stride={stride}, n_bins={n_bins})...")
     feat_files = sorted(feat_dir.glob("*.npy"))
     all_detections = {}
     n_skipped_train = 0
 
     for feat_path in feat_files:
-        video_id = feat_path.stem
+        video_name = feat_path.stem
 
         # Skip training videos to avoid query=gallery
-        if train_ids and video_id in train_ids:
+        if train_names and video_name in train_names:
             n_skipped_train += 1
             continue
 
-        print(f"\n  {video_id}")
+        print(f"\n  {video_name}")
 
         starts, ends, scores, best_gal_idx, win_proj = score_video(
             feat_path, model, gallery_feats,
-            window=window, stride=stride, n_bins=n_bins
+            window=window, stride=stride, n_bins=n_bins,
+            action_id=action_id,
         )
 
         if len(scores) == 0:
@@ -429,19 +468,29 @@ def run(ckpt: Path, window: int = 60, stride: int = 15, topn: int = 1,
             gal_info = ""
             if best_gal_idx is not None and gallery_items:
                 g = gallery_items[best_gal_idx[di]]
-                gal_info = (f"  → {g['video_name']} "
-                           f"[{g['start_frame']}–{g['end_frame']}]")
-            print(f"    #{rank+1}  frames [{starts[di]}–{ends[di]}]  "
-                  f"P(split)={scores[di]:.4f}{gal_info}")
+                gal_info = (f"  -> {g['video_name']} "
+                           f"[{g['start_frame']}-{g['end_frame']}]")
+            print(f"    #{rank+1}  frames [{starts[di]}-{ends[di]}]  "
+                  f"P({action})={scores[di]:.4f}{gal_info}")
 
-        all_detections[video_id] = {
+        # Lookup numeric task_id from full 2545 mapping
+        task_id = name_to_task_id.get(video_name, None)
+
+        all_detections[video_name] = {
+            "video_name": video_name,
+            "task_id": task_id,
+            "action": action,
             "detections": [
                 {
                     "rank": rank + 1,
+                    "video_name": video_name,
+                    "task_id": task_id,
                     "query_start": int(starts[di]),
                     "query_end": int(ends[di]),
                     "score": float(scores[di]),
                     **({"gallery_video": gallery_items[best_gal_idx[di]]["video_name"],
+                        "gallery_task_id": name_to_task_id.get(
+                            gallery_items[best_gal_idx[di]]["video_name"].replace(".mp4", ""), None),
                         "gallery_start": int(gallery_items[best_gal_idx[di]]["start_frame"]),
                         "gallery_end": int(gallery_items[best_gal_idx[di]]["end_frame"]),
                         "gallery_label": gallery_items[best_gal_idx[di]]["label"],
@@ -452,13 +501,14 @@ def run(ckpt: Path, window: int = 60, stride: int = 15, topn: int = 1,
         }
 
         # ── Extract clips ──────────────────────────────────────────────────
-        extract_clips(video_id, starts, ends, scores, best_gal_idx,
-                      gallery_items, det_indices,
-                      conf_threshold=conf_threshold, video_dir=video_dir)
+        extract_clips(video_name, starts, ends, scores, best_gal_idx,
+                      gallery_items, det_indices, action=action,
+                      conf_threshold=conf_threshold, save_dir=out_dir,
+                      video_dir=video_dir)
 
     # ── Save JSON ─────────────────────────────────────────────────────────────
-    OUT_DIR.mkdir(parents=True, exist_ok=True)
-    json_path = OUT_DIR / f"detections_{feat_dir.name}.json"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    json_path = out_dir / f"detections_{feat_dir.name}.json"
     with open(json_path, "w") as f:
         json.dump(all_detections, f, indent=2)
     print(f"\nDetections saved: {json_path}")
@@ -477,11 +527,13 @@ if __name__ == "__main__":
     parser.add_argument("--video_dir", type=Path,
                         default=VIDEO_DIR,
                         help="Matching video directory for clip extraction")
-    parser.add_argument("--window",    type=int,  default=60)
-    parser.add_argument("--stride",    type=int,  default=15)
+    parser.add_argument("--window",    type=int,  default=None,
+                        help="Override window size (default: from checkpoint)")
+    parser.add_argument("--stride",    type=int,  default=None,
+                        help="Override stride (default: from checkpoint)")
     parser.add_argument("--topn",           type=int,   default=1)
     parser.add_argument("--conf_threshold", type=float, default=CONF_THRESHOLD,
-                        help="Min P(split) to save a clip (0-1)")
+                        help="Min P(action) to save a clip (0-1)")
     args = parser.parse_args()
 
     ckpt = args.ckpt
