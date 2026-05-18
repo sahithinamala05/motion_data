@@ -32,19 +32,16 @@ from typing import Dict, List, Optional, Tuple
 
 # ─── paths ────────────────────────────────────────────────────────────────────
 SEGMENTS_JSON = (
-    "/home/ubuntu/yifan/code/cleanpull/FACT_actseg/"
-    "visualization_results_BH_0.7_2k5_unify_test/instance_segments.json"
+    "/home/ubuntu/us-west-3-fs/sahithi/hard_action_annotations/instance_segments.json"
 )
 CARDS_DIR = (
-    "/home/ubuntu/us-west-3-fs/live_dealer_blackjack/"
-    "roundcut/cards_results/good_quality_rounds/all_jsons"
+    "/home/ubuntu/us-west-3-fs/sahithi/hard_action_annotations/card_detections_roundwise"
 )
 PKL_DIR = Path(
-    "/home/ubuntu/us-west-3-fs/live_dealer_blackjack/"
-    "roundcut/dwpose/good_quality_rounds/dwpose"
+    "/home/ubuntu/us-west-3-fs/sahithi/hard_action_annotations/dwpose_roundwise_v2/predictions"
 )
-RAW_VIDEO_DIR = "/home/ubuntu/yifan/code/FACT_actseg/Data_Filtering/filtered_videos"
-OUTPUT_DIR = Path(__file__).parent / "output_cfa_segments_2k5"
+RAW_VIDEO_DIR = "/home/ubuntu/us-west-3-fs/live_dealer_blackjack/raw/batch_01"
+OUTPUT_DIR = Path("/home/ubuntu/us-west-3-fs/sahithi/hard_action_annotations/full_run/cfa")
 FAILURE_VIS_DIR = OUTPUT_DIR / "failure_vis"
 SUCCESS_VIS_DIR = OUTPUT_DIR / "success_vis"
 
@@ -106,17 +103,34 @@ def get_index_tip_px(
     x_norm, y_norm = hands[hand_idx][INDEX_TIP_KP]
     if x_norm < UNDETECTED_THRESH and y_norm < UNDETECTED_THRESH:
         return None
-    return int(x_norm * W), int(y_norm * H)
+    # scale from source resolution (1080p) to 720p
+    return int(x_norm * W * SCALE), int(y_norm * H * SCALE)
+
+
+SCALE = 1280 / 1920  # card detections are 1080p, scale to 720p
+
+
+def _scale_det(det: dict) -> dict:
+    """Scale a single card detection from 1080p to 720p coordinates."""
+    cx, cy = det["polygon_center"][0]
+    x1, y1, x2, y2 = det["box"]
+    return {
+        **det,
+        "polygon_center": [[cx * SCALE, cy * SCALE]],
+        "box": [int(x1 * SCALE), int(y1 * SCALE),
+                int(x2 * SCALE), int(y2 * SCALE)],
+    }
 
 
 def load_card_detections(jsonl_path: str) -> Dict[int, List[dict]]:
-    """Return {frame_id: [detections]} for frames with at least one detection."""
+    """Return {frame_id: [detections]} for frames with at least one detection.
+    Coordinates are scaled from 1080p to 720p."""
     out: Dict[int, List[dict]] = {}
     with open(jsonl_path) as f:
         for line in f:
             obj = json.loads(line)
             if obj["detections"]:
-                out[obj["frame_id"]] = obj["detections"]
+                out[obj["frame_id"]] = [_scale_det(d) for d in obj["detections"]]
     return out
 
 
@@ -381,17 +395,29 @@ def _load_segment_frames(video_name_base: str, sf: int, ef: int):
         import cv2
     except ImportError:
         return [], 25.0
-    video_path = os.path.join(RAW_VIDEO_DIR, f"{video_name_base}.mp4")
+    # Raw videos: "YYYY-MM-DD HH-MM-SS.mp4"; video_name_base: "YYYY-MM-DD_HH-MM-SS_XXXXXX_YYYYYY"
+    parts = video_name_base.split('_')
+    base_video_name = f"{parts[0]}_{parts[1]}".replace('_', ' ', 1)
+    clip_start_1idx = int(parts[2])
+    video_path = os.path.join(RAW_VIDEO_DIR, f"{base_video_name}.mp4")
+    if not os.path.exists(video_path):
+        # some videos use underscore instead of space
+        video_path = os.path.join(RAW_VIDEO_DIR, f"{parts[0]}_{parts[1]}.mp4")
     if not os.path.exists(video_path):
         return [], 25.0
     cap = cv2.VideoCapture(video_path)
     fps = cap.get(cv2.CAP_PROP_FPS) or 25.0
-    cap.set(cv2.CAP_PROP_POS_FRAMES, sf)
+    # Seek to global frame: clip_start is 1-indexed, sf is relative to clip
+    global_frame = (clip_start_1idx - 1) + sf
+    cap.set(cv2.CAP_PROP_POS_FRAMES, global_frame)
     frames = []
     for _ in range(ef - sf + 1):
         ret, frame = cap.read()
         if not ret:
             break
+        # resize to 720p to match spatial thresholds
+        if frame.shape[1] != IMG_W or frame.shape[0] != IMG_H:
+            frame = cv2.resize(frame, (IMG_W, IMG_H))
         frames.append(frame)
     cap.release()
     return frames, fps
@@ -443,8 +469,7 @@ def visualize_success(vis_segments: List[dict], count: int, out_dir: str):
         sf, ef = info["start_frame"], info["end_frame"]
         print(f"  success vis [{idx}/{total}] {vname} f{sf}-{ef}", flush=True)
         frames, fps = _load_segment_frames(vname, sf, ef)
-        if not frames:
-            frames = [np.zeros((IMG_H, IMG_W, 3), dtype=np.uint8)]
+        assert frames, f"No frames loaded for {vname} f{sf}-{ef} – raw video not found"
 
         chosen = info["chosen_card"]
         cx, cy = int(chosen["polygon_center"][0][0]), int(chosen["polygon_center"][0][1])
@@ -526,12 +551,7 @@ def visualize_failures(all_failures: List[dict], count: int):
         reason = fc.get("reason", "")
 
         if not frames:
-            blank = np.zeros((IMG_H, IMG_W, 3), dtype=np.uint8)
-            cv2.putText(blank, f"[{stage}] f{sf}-{ef}",
-                        (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.75, (255, 165, 0), 2)
-            cv2.putText(blank, reason,
-                        (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
-            frames = [blank] * max(1, int(fps * 2))
+            assert False, f"No frames loaded for {vname} f{sf}-{ef} – raw video not found"
 
         # overlay pose samples on relevant frames
         samples = fc.get("_samples", [])
@@ -559,7 +579,7 @@ def visualize_failures(all_failures: List[dict], count: int):
 # Main
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def process(vis_count: int = 0, fail_vis_count: int = 0):
+def process(vis_count: int = 0, fail_vis_count: int = 0, max_videos: int = 0):
     with open(SEGMENTS_JSON) as f:
         all_segments: Dict[str, List[dict]] = json.load(f)
 
@@ -574,6 +594,8 @@ def process(vis_count: int = 0, fail_vis_count: int = 0):
     all_failures: List[dict] = []
     vis_segments: List[dict] = []
     video_keys = list(all_segments.keys())
+    if max_videos > 0:
+        video_keys = video_keys[:max_videos]
     total_videos = len(video_keys)
     n_skipped = 0
     n_processed = 0
@@ -742,5 +764,34 @@ if __name__ == "__main__":
         "--fail_vis_count", type=int, default=0,
         help="Failure clips to render: 0=none (default), N=random N, -1=all",
     )
+    parser.add_argument(
+        "--vis_only", action="store_true",
+        help=(
+            "Skip filtering; reconstruct vis segments from written annotation JSONs "
+            "and generate visualisations."
+        ),
+    )
+    parser.add_argument(
+        "--max_videos", type=int, default=0,
+        help="Limit processing to first N videos (0=all, default)",
+    )
     args = parser.parse_args()
-    process(vis_count=args.vis_count, fail_vis_count=args.fail_vis_count)
+
+    if args.vis_only:
+        from process_hit_segments import load_vis_segments_from_output
+        vis_segs = load_vis_segments_from_output(OUTPUT_DIR)
+        n = len(vis_segs) if args.vis_count == -1 else args.vis_count
+        print(f"Loaded {len(vis_segs)} segments from annotation JSONs. Visualising {n} …")
+        visualize_success(vis_segs, args.vis_count, str(SUCCESS_VIS_DIR))
+        if args.fail_vis_count != 0:
+            fc_path = OUTPUT_DIR / "failure_cases.json"
+            if fc_path.exists():
+                with open(fc_path) as f:
+                    all_failures = json.load(f)
+                fn = len(all_failures) if args.fail_vis_count == -1 else args.fail_vis_count
+                print(f"Loaded {len(all_failures)} failure cases. Visualising {fn} …")
+                visualize_failures(all_failures, args.fail_vis_count)
+            else:
+                print(f"No failure_cases.json found at {fc_path}")
+    else:
+        process(vis_count=args.vis_count, fail_vis_count=args.fail_vis_count, max_videos=args.max_videos)

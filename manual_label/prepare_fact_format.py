@@ -9,30 +9,26 @@ from collections import defaultdict
 
 # Define the labels to keep (others will be mapped to background)
 KEEP_LABELS = {
-    # 'wait for bets',
-    # 'close bets',
-    # 'clean hand',
-    # 'initial hands 1st',
-    # 'initial hands 2nd',
-    # 'reveal hole card',
-    # 'discard'
+    'tap',
+    'refer',
+    'wave',
+}
+
+# All other actions mapped to background
+BACKGROUND_LABELS = {
     'call for action',
     'hit',
     'dealer hits',
-
-}
-
-# Labels that should be mapped to background (for reference and easy modification)
-BACKGROUND_LABELS = {
-    # 'call for action',
-    'tap',
-    'hit',
-    'refer',
     'double',
     'split',
+    'clean hand',
     'close bets',
+    'wait for bets',
+    'align',
     'initial hands 1st',
-    # Add more labels here as needed
+    'initial hands 2nd',
+    'reveal hole card',
+    'discard',
 }
 
 
@@ -319,9 +315,9 @@ def prepare_dataset(annotations_dir: str, video_root_dir: str, output_dir: str):
 
 if __name__ == "__main__":
     # Configuration
-    annotations_directory = './anno/good_quality_round_annotated_305_0223'
-    video_root_directory = '/home/ubuntu/yifan/code/FACT_actseg/Data_Filtering/filtered_videos'
-    output_directory = '/home/ubuntu/yifan/code/cleanpull/FACT_actseg/data/livedealer'
+    annotations_directory = '/tmp/anno_224465_latest'
+    video_root_directory = '/home/ubuntu/us-west-3-fs/live_dealer_blackjack/roundcut/good_quality_rounds'
+    output_directory = '/home/ubuntu/us-west-3-fs/sahithi/Fact_hard_actions_ambiguous'
 
     # Run preparation
     prepare_dataset(annotations_directory, video_root_directory, output_directory)

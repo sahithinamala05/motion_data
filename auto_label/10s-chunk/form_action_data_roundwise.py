@@ -47,11 +47,35 @@ if not hasattr(np, '_core'):
         _sys.modules.setdefault(f'numpy._core.{_name}', getattr(_np_core, _name))
 
 # For draw_pose visualization
-sys.path.insert(0, str(Path("/home/ubuntu/yifan/code/cleanpull/motion-diffusion-model/data_loaders/humanml/utils")))
-from plot_script import draw_pose
+sys.path.insert(0, str(Path("/home/ubuntu/sahithi/dwpose_repo/ControlNet-v1-1-nightly/annotator/dwpose")))
+from util import draw_bodypose, draw_handpose, draw_facepose
+
+def draw_pose(pose, H, W, background=None):
+    """Draw pose skeleton on background image. If None, uses black canvas."""
+    if background is not None:
+        canvas = background.copy()
+    else:
+        canvas = np.zeros(shape=(H, W, 3), dtype=np.uint8)
+    canvas = draw_bodypose(canvas, pose['bodies']['candidate'], pose['bodies']['subset'])
+    canvas = draw_handpose(canvas, pose['hands'])
+    canvas = draw_facepose(canvas, pose['faces'])
+    return canvas
 
 
 FRAMES_PER_PKL = 300
+
+VIDEO_DIR = "/home/ubuntu/us-west-3-fs/live_dealer_blackjack/raw/batch_01"
+
+
+def find_source_video(base_name: str) -> Optional[str]:
+    """Find the source video for a base_name like '2025-10-01_06-05-15'.
+    Raw videos use space: '2025-10-01 06-05-15.mp4'."""
+    # base_name: YYYY-MM-DD_HH-MM-SS -> filename: YYYY-MM-DD HH-MM-SS.mp4
+    video_filename = base_name.replace('_', ' ', 1) + ".mp4"
+    video_path = os.path.join(VIDEO_DIR, video_filename)
+    if os.path.exists(video_path):
+        return video_path
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -83,7 +107,7 @@ def parse_clip_name(name: str) -> Tuple[str, int, int]:
     XXXXXX / YYYYYY are 1-indexed.
     Returns: (base_name, clip_start_1indexed, clip_end_1indexed)
     """
-    for suffix in ['_annotations.json', '_predictions.json']:
+    for suffix in ['_annotations.json', '_predictions.json', '.json']:
         name = name.replace(suffix, '')
     basename = os.path.basename(name)
     parts = basename.split('_')
@@ -291,7 +315,8 @@ def visualize_merged_round(
     fps: int = 30,
 ):
     """
-    Visualize a merged round pkl as an mp4 video with draw_pose and annotation overlay.
+    Visualize a merged round pkl as an mp4 video with draw_pose overlaid on the
+    original video frames, plus annotation label overlay.
 
     Args:
         pkl_path: path to merged dwpose pkl
@@ -315,6 +340,24 @@ def visualize_merged_round(
     total = len(frames)
     print(f"  Visualizing {basename}: {total} frames")
 
+    # Find source video and determine global frame offset
+    base_name, clip_start_1idx, clip_end_1idx = parse_clip_name(json_path)
+    global_start_frame = clip_start_1idx - 1  # 0-indexed
+
+    video_path = find_source_video(base_name)
+    cap = None
+    if video_path:
+        cap = cv2.VideoCapture(video_path)
+        if cap.isOpened():
+            cap.set(cv2.CAP_PROP_POS_FRAMES, global_start_frame)
+            print(f"  Source video: {os.path.basename(video_path)} (seeking to frame {global_start_frame})")
+        else:
+            print(f"  Warning: Could not open source video, falling back to black background")
+            cap.release()
+            cap = None
+    else:
+        print(f"  Warning: Source video not found for {base_name}, falling back to black background")
+
     # Video output
     temp_path = os.path.join(vis_dir, f"{basename}_vis_temp.mp4")
     final_path = os.path.join(vis_dir, f"{basename}_vis.mp4")
@@ -323,14 +366,28 @@ def visualize_merged_round(
 
     if not writer.isOpened():
         print(f"  Error: Could not open video writer for {temp_path}")
+        if cap:
+            cap.release()
         return
 
     for idx in tqdm(range(total), desc=f"  Rendering", leave=False):
         item = frames[idx]
         pose = item['pose']
 
-        # Use draw_pose for proper skeleton rendering (returns RGB)
-        canvas = draw_pose(pose, H=height, W=width)
+        # Read video frame as background
+        bg = None
+        if cap:
+            ret, video_frame = cap.read()
+            if ret:
+                # Resize to match output dimensions if needed
+                vh, vw = video_frame.shape[:2]
+                if vw != width or vh != height:
+                    video_frame = cv2.resize(video_frame, (width, height))
+                # Convert BGR -> RGB for draw_pose (which works in RGB)
+                bg = cv2.cvtColor(video_frame, cv2.COLOR_BGR2RGB)
+
+        # Draw pose on video frame background (or black if no video)
+        canvas = draw_pose(pose, H=height, W=width, background=bg)
 
         # Convert RGB -> BGR for cv2
         canvas = cv2.cvtColor(canvas, cv2.COLOR_RGB2BGR)
@@ -349,10 +406,12 @@ def visualize_merged_round(
         writer.write(canvas)
 
     writer.release()
+    if cap:
+        cap.release()
 
     # Convert to h264
     cmd = [
-        'ffmpeg', '-y', '-i', temp_path,
+        '/usr/bin/ffmpeg', '-y', '-i', temp_path,
         '-c:v', 'libx264', '-preset', 'medium', '-crf', '23',
         '-pix_fmt', 'yuv420p', final_path
     ]
@@ -497,12 +556,12 @@ def main():
 
     PKL_DIR = "/home/ubuntu/us-west-3-fs/live_dealer_blackjack/dwpose/batch_01/dwpose"
     ANNOTATION_DIR = ""
-    PREDICTION_DIR = "/home/ubuntu/yifan/code/motion-data-process/auto_label/10s-chunk/data/inference_results_filtered_videos_26k/predictions_json_with_meta"
-    OUTPUT_BASE = "/home/ubuntu/us-west-3-fs/live_dealer_blackjack/action_annotation/mixed_mini_batch/dwpose/AutoLabeling_batch_01_part_1"
+    PREDICTION_DIR = "/home/ubuntu/us-west-3-fs/sahithi/hard_action_annotations/predictions_json"
+    OUTPUT_BASE = "/home/ubuntu/us-west-3-fs/sahithi/hard_action_annotations/dwpose_roundwise_v2"
     OUTPUT_ANNOT = os.path.join(OUTPUT_BASE, "annotations")
     OUTPUT_PRED = os.path.join(OUTPUT_BASE, "predictions")
-    VIS_DIR = "/home/ubuntu/yifan/code/motion-data-process/auto_label/10s-chunk/data/inference_results_filtered_videos_26k"
-    STATS_PATH = "/home/ubuntu/yifan/code/motion-data-process/auto_label/10s-chunk/data/inference_results_filtered_videos_26k/merged_dwpose_stats.txt"
+    VIS_DIR = "/home/ubuntu/sahithi/vis/dwpose_vis"
+    STATS_PATH = os.path.join(OUTPUT_BASE, "merged_dwpose_stats.txt")
 
     os.makedirs(OUTPUT_ANNOT, exist_ok=True)
     os.makedirs(OUTPUT_PRED, exist_ok=True)
@@ -524,7 +583,7 @@ def main():
         if ANNOTATION_DIR else []
     )
     prediction_files = (
-        sorted(glob.glob(os.path.join(PREDICTION_DIR, "*_predictions.json")))
+        sorted(glob.glob(os.path.join(PREDICTION_DIR, "*.json")))
         if PREDICTION_DIR else []
     )
     print(f"Found {len(annotation_files)} annotation files"
