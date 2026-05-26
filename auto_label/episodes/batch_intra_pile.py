@@ -62,7 +62,6 @@ def process_one(round_name, model, cards_dir, video_dir, out_dir,
     # Summarize
     by_seat = {}
     doubles = 0
-    splits = 0
     unassigned = 0
     for t in tracks:
         s = t.get("seat")
@@ -71,7 +70,6 @@ def process_one(round_name, model, cards_dir, video_dir, out_dir,
             continue
         by_seat[s] = by_seat.get(s, 0) + 1
         if t.get("double"): doubles += 1
-        if t.get("split_pile"): splits += 1
 
     # Serialize
     out_dir = Path(out_dir)
@@ -86,7 +84,6 @@ def process_one(round_name, model, cards_dir, video_dir, out_dir,
             "seat_via": t.get("seat_via"),
             "ordinal": t.get("ordinal"),
             "double": t.get("double", False),
-            "split_pile": t.get("split_pile", 0),
             "first_frame": t["first_frame"],
             "last_frame": t["last_frame"],
             "first_center": t["first_center"],
@@ -127,7 +124,6 @@ def process_one(round_name, model, cards_dir, video_dir, out_dir,
         "n_tracks": len(tracks),
         "n_unassigned": unassigned,
         "n_doubles": doubles,
-        "n_splits": splits,
         "by_seat": by_seat,
     }
 
@@ -175,13 +171,11 @@ def main():
         n_seats = [r["n_seats"] for r in ok_results]
         n_tracks = [r["n_tracks"] for r in ok_results]
         n_unassigned = [r["n_unassigned"] for r in ok_results]
-        any_splits = sum(1 for r in ok_results if r["n_splits"] > 0)
         any_doubles = sum(1 for r in ok_results if r["n_doubles"] > 0)
         print(f"Seats found  : mean={np.mean(n_seats):.2f}  median={np.median(n_seats):.0f}  min={min(n_seats)}  max={max(n_seats)}")
         print(f"Tracks       : mean={np.mean(n_tracks):.2f}  median={np.median(n_tracks):.0f}  min={min(n_tracks)}  max={max(n_tracks)}")
         print(f"Unassigned   : mean={np.mean(n_unassigned):.2f}  any-unassigned-rounds={sum(1 for u in n_unassigned if u > 0)}/{n_ok}")
         print(f"Doubles flagged in: {any_doubles}/{n_ok} rounds")
-        print(f"Splits  flagged in: {any_splits}/{n_ok} rounds")
 
     if args.summary_json:
         with open(args.summary_json, "w") as f:

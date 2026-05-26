@@ -1,0 +1,9 @@
+path: /home/ubuntu/sahithi/motion-data-process/auto_label/yolo_table_objects/dataset
+train: images/train
+val: images/val
+
+names:
+  0: discard_tray
+  1: shoe
+  2: spare_shoe
+  3: scanner

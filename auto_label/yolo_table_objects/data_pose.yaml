@@ -1,0 +1,12 @@
+path: /home/ubuntu/sahithi/motion-data-process/auto_label/yolo_table_objects/dataset_pose
+train: images/train
+val: images/val
+
+kpt_shape: [7, 3]
+flip_idx: [0, 1, 2, 3, 4, 5, 6]
+
+names:
+  0: discard_tray
+  1: shoe
+  2: spare_shoe
+  3: scanner
