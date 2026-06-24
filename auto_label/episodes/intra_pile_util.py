@@ -1,5 +1,5 @@
 """Intra-pile post-processing: take per-frame card detections + per-round seat
-OBBs and emit per-card labels <player_idx, ordinal, double, split_pile>.
+OBBs and emit per-card labels <player_idx, ordinal, double>.
 
 Heuristics (v1):
 - Tracking: greedy nearest-neighbor by rank+suit + spatial proximity across frames.
@@ -7,9 +7,6 @@ Heuristics (v1):
 - Ordinal: 1-indexed order of first-appearance frames within each seat.
 - Double: a card whose AABB aspect ratio is "wide" (w/h > 1.1) AND there are >= 3
   cards in the seat. Marks the 3rd+ card that's clearly perpendicular.
-- Split: per seat, if a 2-cluster KMeans on card centers has within-cluster spread
-  much smaller than between-cluster spread (BC/WC > 2.0), call it a split and
-  assign cards to "pile_1" (leftmost cluster center) or "pile_2" (rightmost).
 """
 
 from __future__ import annotations
@@ -338,7 +335,7 @@ def assign_doubles_from_frame(
          (using each card's matching track ordinal).
       3. Compute consecutive direction vectors and check angle changes.
 
-    Skips Dealer and seats already flagged as split.
+    Skips Dealer.
     """
     for t in tracks:
         t["double"] = False
@@ -365,8 +362,6 @@ def assign_doubles_from_frame(
         if len(dets) < 3:
             continue
         seat_tracks = [t for t in tracks if t.get("seat") == sid]
-        if any(t.get("split_pile", 0) for t in seat_tracks):
-            continue
         # Match each detection to a seat track using (rank, suit) AND
         # centroid proximity, so duplicate-identity cards (same rank+suit at
         # different table positions) get their distinct ordinals.
@@ -423,7 +418,7 @@ def assign_doubles(tracks: List[dict],
     The first card whose short-axis step has the opposite sign to the
     previous step is flagged as the double.
 
-    Skips: Dealer, seats with < 3 cards, seats already labelled as split.
+    Skips: Dealer, seats with < 3 cards.
     """
     by_seat: Dict[int, List[dict]] = {}
     for t in tracks:
@@ -438,8 +433,6 @@ def assign_doubles(tracks: List[dict],
 
     for s, ts in by_seat.items():
         if s == 0:
-            continue
-        if any(t.get("split_pile", 0) for t in ts):
             continue
         corners = seat_obbs.get(s) or seat_obbs.get(str(s))
         if corners is None:
@@ -492,196 +485,6 @@ def assign_doubles(tracks: List[dict],
             ts_sorted[idx]["double"] = True
 
 
-# ---------- split ----------
-
-def _two_cluster_score(centers: np.ndarray) -> Tuple[float, np.ndarray]:
-    """K-means with k=2, deterministic init at extreme x. Returns
-    (between_cluster_dist / within_cluster_std, cluster_assignment 0/1)."""
-    if len(centers) < 2:
-        return 0.0, np.zeros(len(centers), dtype=int)
-    xs = centers[:, 0]
-    c1 = centers[np.argmin(xs)].copy()
-    c2 = centers[np.argmax(xs)].copy()
-    for _ in range(20):
-        d1 = np.linalg.norm(centers - c1, axis=1)
-        d2 = np.linalg.norm(centers - c2, axis=1)
-        assign = (d2 < d1).astype(int)
-        new_c1 = centers[assign == 0].mean(axis=0) if (assign == 0).any() else c1
-        new_c2 = centers[assign == 1].mean(axis=0) if (assign == 1).any() else c2
-        if np.allclose(new_c1, c1) and np.allclose(new_c2, c2):
-            break
-        c1, c2 = new_c1, new_c2
-    bc = float(np.linalg.norm(c1 - c2))
-    # within-cluster mean-distance-to-centroid
-    wc_parts = []
-    if (assign == 0).any():
-        wc_parts.append(np.linalg.norm(centers[assign == 0] - c1, axis=1).mean())
-    if (assign == 1).any():
-        wc_parts.append(np.linalg.norm(centers[assign == 1] - c2, axis=1).mean())
-    wc = float(np.mean(wc_parts)) if wc_parts else 1e-6
-    # pile_1 = leftmost cluster (smaller mean x)
-    left_label = 0 if c1[0] < c2[0] else 1
-    pile = np.where(assign == left_label, 1, 2)
-    return bc / max(wc, 1e-6), pile
-
-
-def _is_collinear(centers: np.ndarray, tol_px: float) -> bool:
-    """True if all centers lie within `tol_px` perpendicular distance of the
-    line through the first and last centers (i.e., they're roughly in a row)."""
-    if len(centers) < 3:
-        return True
-    p1, pn = centers[0], centers[-1]
-    dx, dy = pn[0] - p1[0], pn[1] - p1[1]
-    L = math.hypot(dx, dy)
-    if L < 1:
-        return True
-    for c in centers:
-        perp = abs(dx * (c[1] - p1[1]) - dy * (c[0] - p1[0])) / L
-        if perp > tol_px:
-            return False
-    return True
-
-
-def _normalize_rank(rank: str) -> str:
-    """Treat 10/J/Q/K as ten-valued for split purposes — matches the existing
-    split-segment detector."""
-    if rank in ("10", "J", "Q", "K"):
-        return "T"
-    return rank
-
-
-def _center_at_fid(track, target_fid):
-    """Return the track's centroid at the observation closest to target_fid."""
-    of, cs = track["obs_frames"], track["centers"]
-    i = min(range(len(of)), key=lambda k: abs(of[k] - target_fid))
-    return cs[i]
-
-
-def _project_to_obb_local(point, corners):
-    """Map an image-coord point into the canonical OBB frame.
-
-    We pick the OBB edge that's more vertical in image space (greater
-    |dy|) as the canonical vertical axis — this keeps cards upright in
-    the warped crop regardless of which edge the model labels as "long".
-    Returns (x_local, y_local) where +x is along the more-horizontal
-    edge and +y is along the more-vertical edge.
-    """
-    c0, c1, c3 = corners[0], corners[1], corners[3]
-    e01 = (c1[0] - c0[0], c1[1] - c0[1])
-    e03 = (c3[0] - c0[0], c3[1] - c0[1])
-    L01 = math.hypot(*e01)
-    L03 = math.hypot(*e03)
-    if L01 < 1.0 or L03 < 1.0:
-        return None
-    # "More vertical" = larger |dy|
-    if abs(e01[1]) >= abs(e03[1]):
-        vert_v, vert_len = e01, L01
-        horiz_v, horiz_len = e03, L03
-    else:
-        vert_v, vert_len = e03, L03
-        horiz_v, horiz_len = e01, L01
-    vx, vy = vert_v[0] / vert_len, vert_v[1] / vert_len
-    hx, hy = horiz_v[0] / horiz_len, horiz_v[1] / horiz_len
-    dx, dy = point[0] - c0[0], point[1] - c0[1]
-    return (dx * hx + dy * hy, dx * vx + dy * vy)
-
-
-def assign_splits(tracks: List[dict],
-                  seat_obbs: Dict[int, List[List[float]]] = None,
-                  rep_fid: int = None,
-                  min_cards: int = 3,
-                  min_pair_dist_px: float = 25.0,
-                  max_horiz_angle_deg: float = 40.0) -> None:
-    """Mark a seat as a split when the first 2 cards (by ordinal) sit
-    roughly horizontal in the seat's OBB-aligned local frame at rep_fid —
-    i.e. the dealer separated the initial pair side-by-side across the
-    seat's short axis (perpendicular to the fan direction).
-
-    Rule:
-      1. Non-Dealer seat with >= min_cards cards.
-      2. ord1 and ord2 must be a same-rank pair (only pairs are splittable).
-         If ord1/ord2 track is dead at rep_fid, fall back to the next
-         same-normalized-rank track that is alive.
-      3. Both centroids at rep_fid must lie inside the seat OBB.
-      4. Project both centroids into the OBB-local frame (long axis = y,
-         short axis = x). Angle from short axis = atan2(|local_dy|,
-         |local_dx|). Less than max_horiz_angle_deg → split.
-      5. Assign piles via 2-cluster k-means on rep-frame centroids.
-    """
-    by_seat: Dict[int, List[dict]] = {}
-    for t in tracks:
-        t["split_pile"] = 0
-        if t.get("seat") is None:
-            continue
-        by_seat.setdefault(t["seat"], []).append(t)
-
-    def track_center(t):
-        if rep_fid is not None and "obs_frames" in t:
-            return _center_at_fid(t, rep_fid)
-        return t["centers"][-1]
-
-    def alive_at_rep(t):
-        if rep_fid is None:
-            return True
-        return t["first_frame"] <= rep_fid <= t["last_frame"]
-
-    for s, ts in by_seat.items():
-        if s == 0 or len(ts) < min_cards:
-            continue
-        corners = None
-        if seat_obbs is not None:
-            corners = seat_obbs.get(s) or seat_obbs.get(str(s))
-        if corners is None:
-            continue
-        ts_ord = sorted([t for t in ts if t.get("ordinal")],
-                        key=lambda t: t["ordinal"])
-        if len(ts_ord) < 2:
-            continue
-        r1 = ts_ord[0].get("rank", "?")
-        r2 = ts_ord[1].get("rank", "?")
-        if r1 in ("?", "U") or r2 in ("?", "U"):
-            continue
-        if _normalize_rank(r1) != _normalize_rank(r2):
-            continue
-        t1 = ts_ord[0]
-        t2 = ts_ord[1]
-        if rep_fid is not None and not alive_at_rep(t1):
-            for tc in ts_ord:
-                if tc is t1 or tc is t2:
-                    continue
-                if _normalize_rank(tc.get("rank", "?")) == _normalize_rank(r1) and alive_at_rep(tc):
-                    t1 = tc
-                    break
-        if rep_fid is not None and not alive_at_rep(t2):
-            for tc in ts_ord:
-                if tc is t1 or tc is t2:
-                    continue
-                if _normalize_rank(tc.get("rank", "?")) == _normalize_rank(r1) and alive_at_rep(tc):
-                    t2 = tc
-                    break
-        c1 = track_center(t1)
-        c2 = track_center(t2)
-        # Both centroids must sit inside the seat OBB
-        if not (point_in_obb(c1, corners) and point_in_obb(c2, corners)):
-            continue
-        l1 = _project_to_obb_local(c1, corners)
-        l2 = _project_to_obb_local(c2, corners)
-        if l1 is None or l2 is None:
-            continue
-        dx = l2[0] - l1[0]
-        dy = l2[1] - l1[1]
-        mag = math.hypot(dx, dy)
-        if mag < min_pair_dist_px:
-            continue
-        ang_deg = math.degrees(math.atan2(abs(dy), abs(dx)))
-        if ang_deg >= max_horiz_angle_deg:
-            continue
-        centers = np.array([track_center(t) for t in ts])
-        score, piles = _two_cluster_score(centers)
-        for t, pid in zip(ts, piles):
-            t["split_pile"] = int(pid)
-
-
 # ---------- top-level convenience ----------
 
 def dedup_frame_detections(dets, dist_px: float = 20.0):
@@ -726,7 +529,7 @@ def label_round(
     dedup_dets: bool = True,
 ) -> List[dict]:
     """Run the full pipeline on one round's frames. Returns the list of tracks
-    with seat/ordinal/double/split_pile fields populated.
+    with seat/ordinal/double fields populated.
 
     Card-back ("CB") detections come from the dealer's shoe / deck and don't
     represent on-table playable cards, so they're dropped by default.
@@ -746,7 +549,6 @@ def label_round(
             t["track_id"] = i
     assign_seats(tracks, seat_obbs, src_w, src_h, img_w, img_h)
     assign_ordinals(tracks, seat_obbs=seat_obbs)
-    assign_splits(tracks, seat_obbs=seat_obbs, rep_fid=rep_fid)
     # Simple double detection on a single representative frame's detections
     # (frames already deduped above if dedup_dets=True)
     if rep_fid is not None:

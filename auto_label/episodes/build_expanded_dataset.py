@@ -1,13 +1,13 @@
 """Expand the seat-OBB annotation dataset by duplicating split-flagged images.
 
 Rule:
-  - Base multiplier = 1 (each image appears once).
-  - If the image's round name matches any PNG in the split frames dir
-    (/clus_anno/split/<round>_fNNN.png), multiplier = 2.
+  - Images flagged as "split" get `--split_mult` copies; the rest get `--rest_mult`.
+  - Flagging mode is `--match_mode round` (strip `_fNNN.png`, match by round name)
+    or `filename` (require the exact PNG name to be in the split frames dir).
 
 Duplicates are written as renamed copies (e.g. `<stem>_r1.png`) so train_yolo_obb
 can symlink each one independently. The train/val split is done on the *unique*
-image set so duplicates never leak between sides.
+image set so duplicates never leak between sides; val keeps originals only.
 """
 
 import argparse
@@ -25,21 +25,34 @@ def round_from_image_name(image_name: str) -> str:
     return re.sub(r"_f\d+\.png$", "", image_name)
 
 
-def load_split_rounds(split_frames_dir: str) -> set:
-    """Round = stem of any PNG in the split frames dir (after stripping `_fNNN.png`)."""
+def load_split_keys(split_frames_dir: str, match_mode: str) -> set:
+    """Return the set of keys (rounds or filenames) that identify a "split" image."""
     sd = Path(split_frames_dir)
     if not sd.exists():
         raise SystemExit(f"Missing {sd}")
-    rounds = set()
+    keys = set()
     for f in sd.iterdir():
-        m = re.match(r"(.+?)_f\d+\.png$", f.name)
-        if m:
-            rounds.add(m.group(1))
-    return rounds
+        if match_mode == "round":
+            m = re.match(r"(.+?)_f\d+\.png$", f.name)
+            if m:
+                keys.add(m.group(1))
+        elif match_mode == "filename":
+            if f.name.endswith(".png"):
+                keys.add(f.name)
+        else:
+            raise SystemExit(f"Bad match_mode: {match_mode}")
+    return keys
 
 
-def multiplier_for(entry: dict, split_rounds: set) -> int:
-    return 5 if round_from_image_name(entry["image"]) in split_rounds else 1
+def is_split(entry: dict, split_keys: set, match_mode: str) -> bool:
+    if match_mode == "round":
+        return round_from_image_name(entry["image"]) in split_keys
+    return entry["image"] in split_keys
+
+
+def multiplier_for(entry: dict, split_keys: set, match_mode: str,
+                   split_mult: int, rest_mult: int) -> int:
+    return split_mult if is_split(entry, split_keys, match_mode) else rest_mult
 
 
 def main():
@@ -68,17 +81,25 @@ def main():
     )
     p.add_argument("--val_frac", type=float, default=0.15)
     p.add_argument("--seed", type=int, default=42)
+    p.add_argument("--split_mult", type=int, default=5,
+                   help="copies of each split-flagged image (train only).")
+    p.add_argument("--rest_mult", type=int, default=1,
+                   help="copies of each non-split image (train only).")
+    p.add_argument("--match_mode", choices=("round", "filename"), default="round",
+                   help="'round' strips _fNNN.png and matches round names; "
+                        "'filename' requires the exact PNG to live in split_frames_dir.")
     args = p.parse_args()
 
     src = json.load(open(args.in_json))
-    split_rounds = load_split_rounds(args.split_frames_dir)
-    print(f"Loaded {len(src['annotations'])} annotations; {len(split_rounds)} split rounds")
+    split_keys = load_split_keys(args.split_frames_dir, args.match_mode)
+    print(f"Loaded {len(src['annotations'])} annotations; "
+          f"{len(split_keys)} split keys (mode={args.match_mode})")
+    print(f"Multipliers: split×{args.split_mult}  rest×{args.rest_mult}")
 
-    # Bucket by whether the image's round is a split round, then stratify.
+    # Bucket by whether the image is flagged as a split, then stratify.
     buckets = {True: [], False: []}
     for e in src["annotations"]:
-        rnd = round_from_image_name(e["image"])
-        buckets[rnd in split_rounds].append(e)
+        buckets[is_split(e, split_keys, args.match_mode)].append(e)
 
     stats = {k: len(v) for k, v in buckets.items()}
     print(f"Unique images by split-match: {{in_split: {stats[True]}, not_split: {stats[False]}}}")
@@ -113,9 +134,10 @@ def main():
         out_e["split"] = "val"
         out_anns.append(out_e)
 
-    # Train: split rounds appear twice (orig + _r1), others once.
+    # Train: split-flagged images appear split_mult times, others rest_mult times.
     for e in train_set:
-        m = multiplier_for(e, split_rounds)
+        m = multiplier_for(e, split_keys, args.match_mode,
+                           args.split_mult, args.rest_mult)
         stem, ext = e["image"].rsplit(".", 1)
         for k in range(m):
             new_name = e["image"] if k == 0 else f"{stem}_r{k}.{ext}"
@@ -133,7 +155,10 @@ def main():
         "annotations": out_anns,
     }
     json.dump(out, open(args.out_json, "w"), indent=2)
-    expanded_train = sum(multiplier_for(e, split_rounds) for e in train_set)
+    expanded_train = sum(
+        multiplier_for(e, split_keys, args.match_mode, args.split_mult, args.rest_mult)
+        for e in train_set
+    )
     print(f"\nWrote expanded dataset: {len(out_anns)} entries -> {args.out_json}")
     print(f"  unique val: {len(val_set)}")
     print(f"  expanded train: {expanded_train}  (vs {len(train_set)} unique)")

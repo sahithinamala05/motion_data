@@ -234,7 +234,6 @@ def draw_card_tracks(
             if (rank, suit) == ("CB", "CB"):
                 continue
             cx, cy = int(pc[0] * sx), int(pc[1] * sy)
-            # Which seat OBB contains this centroid?
             seat = None
             for sid, corners in seat_obbs.items():
                 if point_in_obb_local(pc, corners):
@@ -274,22 +273,18 @@ def draw_card_tracks(
         via = t.get("seat_via") or ""
         is_fallback = via.startswith("nearest")
         if is_fallback:
-            cv2.circle(img, (cx, cy), 6, col, 2)               # hollow ring
-            # dotted line from point to seat centroid
+            cv2.circle(img, (cx, cy), 6, col, 2)
             sc = seat_centroids.get(seat)
             if sc is not None:
                 _dotted_line(img, (cx, cy), tuple(sc), col)
         else:
-            cv2.circle(img, (cx, cy), 4, col, -1)              # solid dot
+            cv2.circle(img, (cx, cy), 4, col, -1)
         seat_name = SEAT_NAMES[seat]
         ord_ = t.get("ordinal", "?")
         tag = f"{seat_name}:{ord_}"
         if t.get("double"):
             tag += " D"
-        sp = t.get("split_pile", 0)
-        if sp:
-            tag += f" S{sp}"
-        cv2.putText(img, tag, (cx + 6, cy - 6),
+        cv2.putText(img, tag, (cx + 6, cy - 10),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.4, col, 1)
 
 
@@ -395,7 +390,6 @@ def make_round_video(
                 cv2.circle(frame, (cx, cy), 4, col, -1)
             tag = f"{SEAT_NAMES[seat]}:{t.get('ordinal','?')}"
             if t.get("double"): tag += " D"
-            if t.get("split_pile"): tag += f" S{t['split_pile']}"
             cv2.putText(frame, tag, (cx + 6, cy - 6),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.4, col, 1)
         # Frame counter
@@ -498,7 +492,6 @@ def main():
     # Summarize
     by_seat: dict[int, int] = {}
     doubles = 0
-    splits = 0
     unassigned = 0
     for t in tracks:
         s = t.get("seat")
@@ -507,9 +500,8 @@ def main():
             continue
         by_seat[s] = by_seat.get(s, 0) + 1
         if t.get("double"): doubles += 1
-        if t.get("split_pile"): splits += 1
     print(f"Cards per seat: {dict(sorted(by_seat.items()))}")
-    print(f"Doubles flagged: {doubles}   Splits flagged: {splits}   Unassigned: {unassigned}")
+    print(f"Doubles flagged: {doubles}   Unassigned: {unassigned}")
 
     # Save JSON (trim heavy fields for readability)
     out_json = out_dir / f"{args.round}_per_card.json"
@@ -523,7 +515,6 @@ def main():
             "seat_via": t.get("seat_via"),
             "ordinal": t.get("ordinal"),
             "double": t.get("double", False),
-            "split_pile": t.get("split_pile", 0),
             "first_frame": t["first_frame"],
             "last_frame": t["last_frame"],
             "first_center": t["first_center"],
