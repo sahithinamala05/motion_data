@@ -6,7 +6,7 @@ and run-length-compressed.
 
 - **Location:** `/home/ubuntu/us-west-3-fs/sahithi/initial_hand/`
 - **Files:** `18,914` × `<round>_predictions.json` (full ~26k autolabel batch).
-- **Human-adjusted subset:** 378 files, same schema, in `initial_hand_adj/` (§4).
+- **Human-adjusted subset:** 378 files, same schema, in `initial_hand_adj/` .
 
 ---
 
