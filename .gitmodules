@@ -1,0 +1,32 @@
+[submodule "Diffsynth"]
+	path = Diffsynth
+	url = git@github.com:valka-ai/DiffSynth.git
+	branch = causal
+[submodule "Wilor"]
+	path = Wilor
+	url = git@github.com:sahithinamala05/Wilor.git
+	branch = main
+[submodule "actionformer"]
+	path = actionformer
+	url = https://github.com/happyharrycn/actionformer_release.git
+	branch = main
+[submodule "SAM"]
+	path = SAM
+	url = https://github.com/facebookresearch/sam3.git
+	branch = main
+[submodule "lance"]
+	path = lance
+	url = https://github.com/bytedance/Lance.git
+	branch = main
+[submodule "dwpose_repo"]
+	path = dwpose_repo
+	url = https://github.com/IDEA-Research/DWPose.git
+	branch = onnx
+[submodule "motion-data-process"]
+	path = motion-data-process
+	url = git@github.com:valka-ai/motion-data-process.git
+	branch = add-initial-hand-code
+[submodule "FACT_actseg"]
+	path = FACT_actseg
+	url = https://github.com/valka-ai/FACT_actseg.git
+	branch = main
