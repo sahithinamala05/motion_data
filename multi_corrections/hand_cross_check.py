@@ -27,9 +27,10 @@ SRC=[("/home/ubuntu/us-west-3-fs/sahithi/Wilor/video_cut_wilor_rem_new","_dealer
      ("/home/ubuntu/us-west-3-fs/sahithi/Wilor/video_cut_wilor","_dwpose.pkl")]
 OUT="/home/ubuntu/us-west-3-fs/sahithi/hand_cross_check"
 FPS=30.0
-IOU_T=0.20
+IOU_T=0.50   # hand boxes must overlap >=50%
 PTS_T=10
-MIN_RUN=2   # ignore isolated single-frame crosses; a segment must be >= MIN_RUN consecutive frames
+MIN_RUN=5    # require sustained overlap: a segment must be >= MIN_RUN consecutive frames
+             # (drops brief touches; run-length dist is bimodal, real crosses hold 30+ frames)
 
 def hand_valid(h):
     ok=np.isfinite(h).all(1)&(h[:,0]>-0.05)&(h[:,0]<1.05)&(h[:,1]>-0.05)&(h[:,1]<1.05)
