@@ -20,8 +20,8 @@ FPS=30.0; THRESH=1.0; MIN_RUN=2   # bad = a joint moved more than a full shoulde
 RSHO,LSHO=2,5
 JOINT_NAMES={0:'nose',1:'neck',2:'Rsho',3:'Relb',4:'Rwri',5:'Lsho',6:'Lelb',7:'Lwri',
  8:'Rhip',9:'Rknee',10:'Rank',11:'Lhip',12:'Lknee',13:'Lank',14:'Reye',15:'Leye',16:'Rear',17:'Lear'}
-# exclude below the hip (knees 9/12, ankles 10/13) — occluded behind the table, unreliable
-ALLOWED={0,1,2,3,4,5,6,7,8,11,14,15,16,17}
+# upper body only: exclude hips(8,11), knees(9,12), ankles(10,13) — occluded behind table
+ALLOWED={0,1,2,3,4,5,6,7,14,15,16,17}
 
 def joints(pose):
     """return {j: np.array([x,y])} for all valid body joints (subset>=0, finite)."""

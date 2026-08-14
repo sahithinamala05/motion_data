@@ -25,6 +25,25 @@ def vh(h):
     h=np.asarray(h,float)
     return h if (h.shape==(21,2) and np.isfinite(h).all() and (np.ptp(h[:,0])+np.ptp(h[:,1]))>1e-4) else None
 def hsz(h): return max(np.ptp(h[:,0]),np.ptp(h[:,1])) or 1e-3
+
+def valid_hands(pose):
+    if not pose or pose.get('hands') is None: return []
+    return [h for h in [vh(x) for x in np.asarray(pose['hands'])] if h is not None]
+
+def match_hands(wp, dp):
+    """pair each WiLoR hand to the nearest DWpose hand by root keypoint (greedy, no reuse).
+    No L/R labels, no body wrists -> works even when DWpose wrists are missing."""
+    W=valid_hands(wp); D=valid_hands(dp)
+    pairs=[]; used=set()
+    for a in W:
+        best=None; bd=1e9
+        for i,b in enumerate(D):
+            if i in used: continue
+            d=np.linalg.norm(a[0]-b[0])
+            if d<bd: bd=d; best=i
+        if best is not None: used.add(best); pairs.append((a,D[best]))
+    return pairs
+
 def wrist(p,j):
     b=p.get('bodies')
     if b is None: return None
@@ -71,13 +90,9 @@ def process(cid):
     except Exception: return None
     n=min(len(W),len(D)); vals=[]; mask=[False]*n; ncmp=0
     for k in range(n):
-        wh=sided(W[k].get('pose') if isinstance(W[k],dict) else None, derive=False)
-        dh=sided(D[k].get('pose') if isinstance(D[k],dict) else None, derive=True)
-        per=[]
-        for side in (True,False):
-            if side in wh and side in dh:
-                a,b=wh[side],dh[side]; sc=(hsz(a)+hsz(b))/2
-                per.append(float((np.linalg.norm(a-b,axis=1)/sc).mean()))
+        wp=W[k].get('pose') if isinstance(W[k],dict) else None
+        dp=D[k].get('pose') if isinstance(D[k],dict) else None
+        per=[float((np.linalg.norm(a-b,axis=1)/((hsz(a)+hsz(b))/2)).mean()) for a,b in match_hands(wp,dp)]
         if per:
             ncmp+=1; v=float(np.median(per)); vals.append(v); mask[k]=v>THRESH
     def pct(q): return round(float(np.percentile(vals,q)),4) if vals else None

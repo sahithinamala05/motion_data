@@ -12,10 +12,10 @@ DW="/home/ubuntu/us-west-3-fs/live_dealer_blackjack/dwpose/batch_01/dwpose"
 VID="/home/ubuntu/us-west-3-fs/live_dealer_blackjack/video_cut/batch_01"
 FPS=30.0
 RWRI,LWRI,RELB,LELB,RSHO,LSHO=4,7,3,6,2,5
-# OpenPose-18 skeleton, NOT below the hip (no knees/ankles)
-BODY_EDGES=[(1,2),(1,5),(2,3),(3,4),(5,6),(6,7),(1,8),(1,11),
+# upper body only (no hips/knees/ankles)
+BODY_EDGES=[(1,2),(1,5),(2,3),(3,4),(5,6),(6,7),
             (1,0),(0,14),(14,16),(0,15),(15,17)]
-BODY_ALLOWED={0,1,2,3,4,5,6,7,8,11,14,15,16,17}
+BODY_ALLOWED={0,1,2,3,4,5,6,7,14,15,16,17}
 CFG={  # src -> (json_dir, pkl_dir, kind, p95key, thresh)
  "dwpose":("dwpose_temporal", DW, "hand", "jump_p95", 1.0),
  "wilor" :("wilor_temporal",  VC, "hand", "jump_p95", 1.0),
@@ -59,17 +59,11 @@ def body_joints(p):
 def _hands_labels(p):
     if not p or p.get('hands') is None: return [],[]
     raw=np.asarray(p['hands']); ir=p.get('hands_is_right'); ir=np.asarray(ir) if ir is not None else None
-    rw=lw=None
-    if ir is None:
-        rw=body_pt(np.asarray(p['bodies']['candidate']),np.asarray(p['bodies']['subset']),4) if p.get('bodies') is not None else None
-        lw=body_pt(np.asarray(p['bodies']['candidate']),np.asarray(p['bodies']['subset']),7) if p.get('bodies') is not None else None
     H=[];L=[]
     for i,x in enumerate(raw):
         h=valid_hand(x)
         if h is None: continue
-        if ir is not None and i<len(ir): lab=bool(ir[i])
-        elif rw is not None and lw is not None: lab=np.linalg.norm(h[0]-rw)<np.linalg.norm(h[0]-lw)
-        else: lab=None
+        lab=bool(ir[i]) if (ir is not None and i<len(ir)) else None   # WiLoR is_right; DWpose None (wrist-free)
         H.append(h); L.append(lab)
     return H,L
 
@@ -90,7 +84,7 @@ def per_frame_vals(D, kind):
                     for h,l in zip(hs,L):
                         if l in pm:
                             b=pm[l]; vv.append(np.mean(np.linalg.norm(h-b,axis=1))/((handsize(h)+handsize(b))/2))
-                else:
+                elif len(hs)==len(prevH):   # wrist-free: nearest-root, only when count stable
                     vv=[np.mean(np.linalg.norm(a-b,axis=1))/((handsize(a)+handsize(b))/2) for a,b in match(hs,prevH)]
                 if vv: vals[k]=float(np.median(vv))
             if k>0 and prevkey is not None and key!=prevkey: presence[k]=True

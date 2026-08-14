@@ -49,18 +49,11 @@ def get_hands(fr):
     if not p or p.get('hands') is None: return [], [], frozenset()
     raw=np.asarray(p['hands']); ir=p.get('hands_is_right')
     ir=np.asarray(ir) if ir is not None else None
-    rw = _wrist(p,4) if ir is None else None    # R wrist
-    lw = _wrist(p,7) if ir is None else None    # L wrist
     hands=[]; labs=[]
     for i,x in enumerate(raw):
         h=vh(x)
         if h is None: continue
-        if ir is not None and i<len(ir):
-            lab=bool(ir[i])
-        elif rw is not None and lw is not None:
-            lab = np.linalg.norm(h[0]-rw) < np.linalg.norm(h[0]-lw)   # True=Right (closer to R wrist)
-        else:
-            lab=None
+        lab = bool(ir[i]) if (ir is not None and i<len(ir)) else None   # WiLoR: is_right; DWpose: None (wrist-free)
         hands.append(h); labs.append(lab)
     # presence key: set of labels if all labelled, else the count
     if hands and all(l is not None for l in labs):
@@ -79,8 +72,8 @@ def jump(cur,curL,prev,prevL):
             if l in pm:
                 b=pm[l]; sc=(hsz(h)+hsz(b))/2
                 vals.append(float((np.linalg.norm(h-b,axis=1)/sc).mean()))
-    else:  # nearest-root fallback
-        used=set()
+    elif len(cur)==len(prev):  # wrist-free: nearest-ROOT match, ONLY when hand count is stable
+        used=set()               # (count change is handled by presence; skip jump to avoid fake spikes)
         for h in cur:
             best=None;bd=1e9
             for i,b in enumerate(prev):
