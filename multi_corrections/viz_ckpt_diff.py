@@ -5,7 +5,15 @@ for each; text turns red where OLD != NEW. Reads clip\tvidpath from diff_viz.txt
 import os, sys, json, subprocess
 import numpy as np, cv2; cv2.setNumThreads(1)
 OLD="/home/ubuntu/us-west-3-fs/sahithi/initial_hand_ckpt_diff/pred_40000/predictions_json"
-NEW="/home/ubuntu/us-west-3-fs/sahithi/livedealer_temporal_metatext_v2_index_coordinates"
+# NEW = autolabeling union (part_1 + remaining), overridable via $NEW_DIRS (colon-separated)
+NEW_DIRS=os.environ.get("NEW_DIRS",
+    "/home/ubuntu/us-west-3-fs/live_dealer_blackjack/action_annotation/mixed_mini_batch/annotation/AutoLabeling_batch_01_part_1:"
+    "/home/ubuntu/us-west-3-fs/live_dealer_blackjack/action_annotation/mixed_mini_batch/annotation/Autolabeling_remaining").split(":")
+def new_path(cid):
+    for d in NEW_DIRS:
+        p=f"{d}/{cid}_predictions.json"
+        if os.path.exists(p): return p
+    return None
 OUT=os.environ.get("VIZ_OUT","/home/ubuntu/us-west-3-fs/sahithi/initial_hand_ckpt_diff/vis_diff")
 FPS=30.0; F=cv2.FONT_HERSHEY_SIMPLEX
 COL={"background":(90,90,90),"clean hand":(120,255,120),"close bets":(200,120,255),
@@ -28,7 +36,7 @@ def strip(img, arr, y0, y1, N):
         x=int(w*i/N); cv2.line(img,(x,y0),(x,y1),c,1)
 
 def render(cid, vp):
-    A=frames_arr(f"{OLD}/{cid}.json"); B=frames_arr(f"{NEW}/{cid}_predictions.json")
+    A=frames_arr(f"{OLD}/{cid}.json"); B=frames_arr(new_path(cid))
     cap=cv2.VideoCapture(vp); w=int(cap.get(3)) or 1920; h=int(cap.get(4)) or 1080
     N=int(cap.get(cv2.CAP_PROP_FRAME_COUNT)) or max(len(A),len(B))
     ff=subprocess.Popen(["ffmpeg","-y","-loglevel","error","-f","rawvideo","-pix_fmt","bgr24","-s",f"{w}x{h}",
@@ -54,7 +62,7 @@ def render(cid, vp):
 
 if __name__=="__main__":
     os.makedirs(OUT,exist_ok=True)
-    for line in open("/tmp/claude-1000/-home-ubuntu/6938b38c-0207-4beb-ac65-f66c4fab8367/scratchpad/diff_viz.txt"):
+    for line in open(os.environ.get("DIFF_LIST","/tmp/claude-1000/-home-ubuntu/6938b38c-0207-4beb-ac65-f66c4fab8367/scratchpad/diff_viz.txt")):
         cid,vp=line.strip().split("\t")
         try: render(cid,vp); print("  viz",cid,flush=True)
         except Exception as e: print("  ERR",cid,e,flush=True)
