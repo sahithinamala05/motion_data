@@ -60,7 +60,7 @@ def build(vid):
     if base_p:
         try: j=json.load(open(base_p))
         except Exception: j={"timeline_segments":[]}
-        segs+=[_clean(s) for s in j.get('timeline_segments',[])]
+        segs+=[dict(s) for s in j.get('timeline_segments',[])]   # keep base as-is (preserves xy_seat + any extra fields)
     for name in ("clean_hand_verified","final_cfa","final_hit"):
         p=IDX[name].get(vid)
         if p: segs+=anno_segments(p)
